@@ -201,6 +201,7 @@ LICENSE                  仓库许可证
 | --- | --- |
 | [开发指南](development/README.zh_CN.md) | AI 工作流、工程规范、CI 与发布流程 |
 | [AI 技能](../skills/README.zh_CN.md) | 开发、环境准备、构建、真机测试与故障诊断 |
+| [CI 固件设备工具](../tools/device_flash/README.zh_CN.md) | 离线包校验、有时限的设备等待与保留 NVS 的刷写 |
 | [硬件资料](hardware-design/README.zh_CN.md) | 板卡事实、接口边界、验收清单与排障 |
 | [中文字体](development/engineering/lvgl-chinese-fonts.zh_CN.md) | 字形覆盖、控件字体选择，以及中文空白排查 |
 | [Wi-Fi 配网](development/engineering/wifi-provisioning.zh_CN.md) | 蓝牙配网实现参考与配套小程序 |

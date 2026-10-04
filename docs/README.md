@@ -207,6 +207,7 @@ provide reference material. Choose the entry that matches your task.
 | --- | --- |
 | [Development](development/README.md) | AI workflow, engineering conventions, CI, and release guidance |
 | [AI skills](../skills/README.md) | Development, environment setup, builds, device testing, and debugging |
+| [CI firmware device tools](../tools/device_flash/README.md) | Offline package verification, bounded device waiting, and NVS-preserving flashing |
 | [Hardware](hardware-design/README.md) | Board facts, interface boundaries, acceptance checklists, and troubleshooting |
 | [Chinese fonts](development/engineering/lvgl-chinese-fonts.md) | Glyph coverage, widget font selection, and blank-text troubleshooting |
 | [Wi-Fi provisioning](development/engineering/wifi-provisioning.md) | Bluetooth provisioning reference and companion mini program |
