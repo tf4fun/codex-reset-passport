@@ -29,6 +29,8 @@ jobs:
         run: |
           apt-get update
           apt-get install --yes --no-install-recommends build-essential curl git ca-certificates
+      - name: Align checkout ownership with the container user
+        run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       - name: Full static, host, firmware and merged-image gate
         run: |
           source /opt/esp/idf/export.sh
