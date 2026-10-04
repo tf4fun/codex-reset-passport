@@ -1,0 +1,53 @@
+--- a/components/bt/common/btc/profile/esp/blufi/blufi_prf.c
++++ b/components/bt/common/btc/profile/esp/blufi/blufi_prf.c
+@@ -114,6 +114,12 @@
+ 
+     if (len != target_data_len) {
+         BTC_TRACE_ERROR("%s: Invalid data length: %d, expected: %d", __func__, len, target_data_len);
++        btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++        return;
++    }
++
++    /* AI Passport: reject malformed fragments before length subtraction. */
++    if (BLUFI_FC_IS_FRAG(hdr->fc) && hdr->data_len < 2) {
+         btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
+         return;
+     }
+@@ -168,7 +174,16 @@
+                 btc_blufi_report_error(ESP_BLUFI_MSG_STATE_ERROR);
+                 return;
+             }
+-            blufi_env.total_len = hdr->data[0] | (((uint16_t) hdr->data[1]) << 8);
++            uint16_t total_len = hdr->data[0] | (((uint16_t) hdr->data[1]) << 8);
++            /* This application accepts at most a one-byte negotiation type
++             * plus 1024 bytes of DH parameters. It does not accept certificate
++             * uploads or arbitrary large custom data over BLUFI. */
++            if (total_len == 0 || total_len > 1025 ||
++                    (size_t)(hdr->data_len - 2) > total_len) {
++                btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
++                return;
++            }
++            blufi_env.total_len = total_len;
+             blufi_env.aggr_buf = osi_malloc(blufi_env.total_len);
+             if (blufi_env.aggr_buf == NULL) {
+                 BTC_TRACE_ERROR("%s no mem, len %d\n", __func__, blufi_env.total_len);
+@@ -176,7 +191,8 @@
+                 return;
+             }
+         }
+-        if (blufi_env.offset + hdr->data_len  - 2 <= blufi_env.total_len){
++        if (blufi_env.aggr_buf != NULL && blufi_env.offset <= blufi_env.total_len &&
++                (size_t)(hdr->data_len - 2) <= (size_t)(blufi_env.total_len - blufi_env.offset)) {
+             memcpy(blufi_env.aggr_buf + blufi_env.offset, hdr->data + 2, hdr->data_len  - 2);
+             blufi_env.offset += (hdr->data_len - 2);
+         } else {
+@@ -194,7 +210,8 @@
+                 return;
+             }
+             /* payload length should be equal to total_len */
+-            if ((blufi_env.offset + hdr->data_len) != blufi_env.total_len) {
++            if (blufi_env.offset > blufi_env.total_len ||
++                    (size_t)hdr->data_len != (size_t)(blufi_env.total_len - blufi_env.offset)) {
+                 BTC_TRACE_ERROR("%s payload is longer than packet length, len %d \n", __func__, blufi_env.total_len);
+                 btc_blufi_report_error(ESP_BLUFI_DATA_FORMAT_ERROR);
+                 return;

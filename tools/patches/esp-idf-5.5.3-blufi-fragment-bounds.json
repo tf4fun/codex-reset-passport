@@ -1,0 +1,10 @@
+{
+  "idf_version": "5.5.3",
+  "source_path": "components/bt/common/btc/profile/esp/blufi/blufi_prf.c",
+  "upstream_sha256": "00c7a39c77b5c71d0b8d2b2aed5a3eed63d56ca8ff2a0e40b855ed8eefba4992",
+  "patched_sha256": "59bf6c34d0b1c54892ca996e8a6bc96097e0074981aa1367ee2294290621a80a",
+  "receiver_upstream_sha256": "5e086862bc1bd149caebf756de2b18d0126ff441b739c21230177cceae8e9063",
+  "receiver_patched_sha256": "841be016807cf8b3cae8ba7a2a362866e7bd3f8a01abb8f5d175964ff1051ad4",
+  "receiver_line_offset": 95,
+  "max_reassembly_bytes": 1025
+}
