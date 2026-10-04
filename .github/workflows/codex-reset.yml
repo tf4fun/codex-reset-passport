@@ -41,7 +41,7 @@ jobs:
       - name: Upload verified firmware and identity
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: codex-reset-v2.2-${{ github.sha }}
+          name: codex-reset-v2.3-${{ github.sha }}
           path: build/ci-artifact/
           if-no-files-found: error
           retention-days: 14
