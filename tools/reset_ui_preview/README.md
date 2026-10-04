@@ -2,101 +2,136 @@
 
 # Actual LVGL reset UI preview
 
-This is a host-only renderer and check harness for the firmware presentation.
-It directly compiles `main/reset_ui.c`, `main/reset_presenter.c`, the bounded
-`main/reset_feed.c` parser, and the same generated Chinese font as firmware.
-It uses the pinned managed LVGL 9.5 source, a 240 × 320 RGB565 display, a 40-row
-partial draw buffer, and the same 24 KiB LVGL allocation pool size. The flush
-callback calls the actual pure BSP rounded-row helper and reads radius 30 from
-`bsp_display.h`, filling clipped corners with black exactly as the BSP does. No web page,
-HTML recreation, USB access, network request, or device flashing is involved.
+The host harness directly compiles firmware `main/reset_ui.c`,
+`reset_presenter.c`, `reset_text.c`, the bounded feed parser and production
+`reset_hold.c`. It renders with pinned LVGL 9.5 at 240 × 320 RGB565, a 40-row
+partial buffer and the unchanged 24 KiB LVGL pool. The flush callback calls the
+actual BSP rounded-row helper with radius 30 from `bsp_display.h`. This is not
+an HTML recreation, device photograph, network request or flash operation.
 
 ## Run
 
-Prerequisites: a C/C++ compiler, CMake, Python 3 with Pillow, and the resolved
-`managed_components/lvgl__lvgl` source. From the repository root:
+Requires a C/C++ compiler, CMake, Python with Pillow and resolved managed LVGL
+sources. From the repository root:
 
 ```bash
 python3 tools/render_reset_preview.py
 python3 tools/render_reset_preview.py --feed /path/to/captured-status.json
 ```
 
-The second command is optional. It reads an existing local response from
-`https://codex-resets.com/api/v1/status`; it does not fetch or upload anything.
-The firmware parser validates it before use. Set `--output` and `--build-dir`
-when different generated paths are needed. Nothing modifies firmware source
-or managed LVGL files. Activate your host/ESP-IDF environment if CMake is not
-on `PATH`.
+The optional feed must already exist locally. The real firmware parser checks
+it; `generated_at` is the reference clock and battery is unavailable. Captured
+screens are named `00-captured-*` (home, reader pages and overview). They are not
+a current live query. All other screens use clearly labeled synthetic fixtures.
+Use `--build-dir` and a fresh `--output` directory as needed. Existing output
+files are retained. Neither command changes managed LVGL files.
 
-## What the images prove
+## Announcement and reader contract
 
-- `00-captured-feed.png`, when requested, uses real captured data and the
-  response's `generated_at` time as the reference clock. Its battery is an
-  unavailable placeholder. It is not a device photograph or a current live
-  query; see the API capture time and SHA-256 in the provenance files.
-- `01` through `17` are deterministic synthetic fixtures: fresh home, details,
-  Bluetooth setup, destructive-action confirmation, offline cached data,
-  first offline boot, overdue schedule, AI prediction, network error, and
-  banked/observed reset details, pending banked reset, and an initial rate limit. The contact sheet explicitly labels them as
-  synthetic and shows each screen at its native 240 × 320 resolution.
-- Actual label bindings are checked for missing glyphs, single-line clipping,
-  and screen-bound overflow. All fixed font-inventory codepoints are checked
-  against the generated LVGL font; known-missing U+9F98 must be rejected.
-- Duplicate updates and 500 page changes exercise the real presentation code
-  in a 24 KiB LVGL pool. The audit reports peak use, remaining memory, largest
-  free block, and fragmentation. Host pointer sizes/draw behavior can differ
-  from the ESP32-C3. This is not a claim about the device's total free heap.
+The four top-level pages are announcement, last executed reset overview,
+statistics and settings. HOME short-confirm opens the reading child. Reading
+UP/DOWN changes text pages; short-confirm returns HOME. Hold-to-sleep remains
+independent. Settings has seven rows, including automatic sleep after 5 minutes
+by default, with 0/off, 5, 10 and 30-minute values.
 
-Output is in `build/reset-ui-preview/screens/` by default: individual PNG/PPM
-files, `synthetic-states-contact-sheet.png`, `audit.txt`, and `manifest.json`.
-The manifest includes presentation/font source hashes, captured-response hash,
-and check status. A nonzero exit reports font/layout failure even when images
-are available. Check the final images after UI source changes. Existing files
-in a reused output folder are retained, so use a fresh `--output` directory
-when the requested scenario set changes.
+- HOME chooses the newer `announced_at` from `latest_reset` and
+  `scheduled_reset`, never a watch's `observed_at`. The time-only HOME shows
+  Chinese relative time as the hero, a secondary absolute local date, and a
+  small reset type/status. It has no body summary or dense reader instructions.
+- Expected timing uses a supplied schedule, explicitly labeled as planned and
+  shown in the configured fixed UTC offset. Missing schedule times stay pending;
+  overdue schedules await confirmation. Without a schedule, only an unexpired
+  forecast's raw `forecast_window` is presented as a prediction. An expired
+  forecast is not a valid plan. Average intervals never create a forecast.
+- Overview uses the latest executed record: regular CODEX quota reset or
+  explicitly banked/backup-quota distribution. Exact local date/time is secondary
+  to Chinese relative time. The note says the time follows the site's record;
+  announcement/observation time is not claimed as precise execution time.
+- Text is bounded to 256 source UTF-8 bytes. Actual active LVGL glyph advances,
+  including pair kerning, fit 178 pixels. Whitespace is preferred; unbroken
+  words/URLs break at complete codepoint boundaries. CR/LF and TAB are normalized.
+- HOME short-confirm still opens the reader. The fixed 16px reading body uses
+  seven lines per page, at most eight pages. Only a quiet date, small page number
+  and domain surround the text; a notice appears only when required. Byte/page clipping has
+  an explicit notice. Unsupported glyphs become `?` with a visible warning.
+  The original text is never translated, executed or treated as markup.
+- Bounded static buffers own the label strings. No text heap allocation, full
+  CJK font, remote translation, clickable-link or QR promise is introduced.
+  The readable feed-site domain is `codex-resets.com`.
 
-Device display, brightness, battery ADC readings, buttons, real Bluetooth/Wi-Fi,
-HTTPS/TLS memory pressure, credentials, and physical Chinese rendering remain
-separate hardware tests. Host rendering is not `Device tests: PASS`.
+The 12/16px fonts cover the fixed UI and printable ASCII. A 25-glyph 24px subset
+is derived directly from the Chinese relative-time formatter. Regeneration and
+license information are in [the assets record](../../assets/README.md#codex-reset-observer-ui-subset).
 
-## Font source and regeneration
+## What the audits prove
 
-See [the assets font record](../../assets/README.md#codex-reset-observer-ui-subset)
-for Noto CJK source/version/hash, OFL license, fixed-string inventory, and exact
-pinned converter commands. `tools/generate_reset_font.py --check` needs only the
-Python standard library: it checks current source text against the inventory and
-verifies the generated C cmap coverage and descriptor bounds. The runtime LVGL
-check is separate and also inspects actual widget font bindings. The firmware never needs Python,
-Pillow, CMake host tools, the source OTF, or the font converter at runtime.
+The harness checks both body-font inventories, the hero subset, known missing
+U+9F98, every visible label's actual selected font, line widths, reserved body
+line budgets and screen/parent bounds. Fixtures cover:
 
-## v2.2 hold-to-sleep preview
+- HOME, every top/child page, 7-row settings, offline/stale data and network errors
+- new scheduled announcement, banked/regular executed or planned states,
+  overdue/null schedule, raw prediction, watch-only, expired and clipped forecasts
+- all four 256-byte wide-word pages, all two unbroken-URL pages,
+  emoji/noncovered Chinese substitution, CR/LF/TAB and source-byte truncation
+- all eight newline-heavy pages, explicit page-limit notice and index clamping
+- Chinese relative times from just now to 99 days/23 hours and beyond 9999 days
 
-`hold-to-sleep-actual-lvgl.gif` records the real firmware `lv_arc` at 40 ms
-intervals (25 fps): 0–100% over 2000 ms, the armed “release to sleep” state,
-the 250 ms stable-release guard, and the existing network-cleanup page.
-The last guard frame is sampled at 2840 ms and the first cleanup frame at
-2880 ms, after a release at 2600 ms. This samples the guard at 25 fps; it does
-not redefine the firmware's 250 ms threshold. Identical GIF frames may merge
-into one longer frame. The GIF is the clean 240 × 320 LCD render, without percentage/countdown text
-or engineering captions. Host-only provenance is recorded in `manifest.json`.
-`hold-to-sleep-progress-strip.png` shows four fill stages without numeric labels.
-The title is “prepare to rest”; before the ring fills the hint is “release to return”, and
-once armed it is “release to sleep”. A crescent is drawn from two small geometric
-discs in the center; no raster asset or additional moon widget is allocated.
-Additional PNGs cover cancelled release, stable-release waiting, and provisioning
-blocking. There is no second standalone sleep-confirmation page.
+The reader runs 500 page/truncation changes after the identical warm-up and
+requires exact live-allocation/free-space equality. Four-top-page navigation is
+also replayed for 1000 measured changes. Two successive 500-change endpoints
+are each 4664 free bytes at 208 live blocks in the diagnostic run. Each measured phase
+must match its own warmed phase exactly; there is no growth tolerance.
+The final v2.3 run audited 90248 visible labels: zero missing glyphs and zero
+clipped labels. The unchanged 24 KiB pool peaked at 17712 bytes; final top-page
+free space was 4664 bytes. These are host-pool results, not device heap results.
 
-A popup creates its widgets once per press gesture. Each progress update keeps
-the same arc, labels, and underlying page objects. While the modal is visible,
-the underlying page's drawing is hidden behind a quiet cream/ink backdrop;
-closing the popup deletes only its objects and restores the page. Read-only
-shared text styles, static-lifetime text buffers, and draw-event card shadows
-keep the unchanged 24 KiB LVGL pool sufficient. No full-screen image is cached.
+PNG/PPM files, `synthetic-states-contact-sheet.png`, `audit.txt`, source hashes
+and `manifest.json` are saved by default under `build/reset-ui-preview/screens/`.
+A nonzero exit reports failure even when screenshots exist. Inspect the actual
+screens after changes. Device brightness, battery ADC, physical buttons, BLE,
+Wi-Fi/HTTPS pressure, credentials and on-device Chinese display remain untested
+by this harness. A host render is not `Device tests: PASS`.
 
-The harness warms arc angles and drawing scratch buffers, then verifies 500 updates
-with stable object identity/count, zero object deletion, unchanged allocation
-count/free space, and a valid allocator. It also retains 500 page-change checks.
-For the v2.2 fixture, the hold check has 24 objects, 234 allocation blocks,
-3536 bytes free before/after, and a 18712-byte recorded peak across all tests.
-1454 rendered labels pass with zero missing glyphs and zero clipped labels.
-These are host-pool results, not device heap or physical-button acceptance.
+## Setup-only Wi-Fi diagnostics
+
+The setup screen distinguishes starting, initialization failure, no saved
+network, connecting attempt `n/5`, retry waiting, and connected-but-save-failed.
+Settings shows the corresponding brief Wi-Fi state. Diagnostic lines display
+numeric codes only: `E` is an error code and `D` is the last disconnect reason.
+They contain no SSID or password and do not assert a root cause. Runtime and
+credential-persistence errors are independent and can be shown together.
+An active provisioning countdown stays visible even if an IP is acquired while
+credential saving fails. The time-only HOME and seven-line reader are unchanged.
+Fixtures `37`–`45` include INT32_MIN/MAX, UINT16_MAX, both errors together,
+provisioning countdown plus save failure, and all startup/retry states.
+
+## v2.3 hold-to-sleep preview
+
+The three clean 240 × 320 GIFs use actual production press/release/tick events:
+
+- `v2.3-fast-tap-no-popup-actual-lvgl.gif`: a 200ms tap emits one TAP, opens the
+  announcement reader and never creates a sleep popup.
+- `v2.3-release-1250ms-unwind-actual-lvgl.gif`: appears at 500ms, fills for the
+  next 750ms, then reverses its last displayed value over 250ms. Returns HOME
+  without a TAP or sleep event.
+- `v2.3-full-hold-release-cleanup-actual-lvgl.gif`: appears at 500ms and fills
+  during the next 1500ms. Release at 2000ms plus 250ms continuously observed
+  all-keys-up produces exactly one sleep intent and enters network cleanup.
+
+Each starts with 400ms of HOME. Frames are sampled every 20ms, with exact event
+boundaries also sampled (sometimes 10ms). GIF merging of identical frames is
+allowed only with preserved dimensions and total encoded duration. The cancel
+fixture preserves progress 493/1000 from 1240ms instead of advancing on release.
+`hold-scenarios.json` records timings/events; `hold-to-sleep-progress-strip.png`
+shows the 0/25/50/100 fill states without numbers on the UI.
+
+The warm cream/ink modal, geometric crescent and persistent LVGL arc are
+unchanged. No framebuffer snapshot or countdown is used. The underlying page
+is retained and hidden during the modal, then restored. Progress stress checks
+500 frames with stable object identity/count, zero deletions, exact warmed
+allocation equality and allocator integrity. Another 100 cancel/open-close
+cycles check the hidden tap window and unchanged underlying objects. Final
+progress had 21 objects, 216 allocations and 4744 bytes free before/after;
+cancel-close had 186 allocations and 6496 bytes free before/after. Reader stress
+had 149 allocations and 8832 bytes free before/after.

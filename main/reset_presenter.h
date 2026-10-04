@@ -7,9 +7,15 @@ typedef struct {
     bool connected, has_credentials, provisioning, wifi_error, clock_ready;
     bool refresh_throttled, settings_editing, restored_cache;
     bool radio_stopped, radio_control_pending;
+    bool wifi_initialized, wifi_connecting;
+    unsigned wifi_attempts;
+    uint16_t wifi_disconnect_reason;
+    int32_t wifi_last_error;
+    int32_t wifi_persistence_error; /* Independent: an IP does not prove a saved credential. */
     int battery;
     unsigned provisioning_seconds;
     unsigned selected_setting;
+    unsigned reading_page;
     unsigned sleep_phase;
     unsigned message; /* 1: save error; 2: sleep error; 3: Wi-Fi off. */
     int16_t draft_utc_offset;

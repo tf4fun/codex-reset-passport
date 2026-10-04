@@ -10,7 +10,7 @@
 static const char fixture[] =
     "{\"data\":{\"latest_reset\":{\"id\":\"2106131810921136451\","
     "\"reset_type\":\"regular\",\"announced_at\":\"2026-10-02T21:18:48.000Z\","
-    "\"text\":\"Reset all propagated. Enjoy.\",\"source\":{\"type\":\"x_post\","
+    "\"text\":\"Reset all propagated. Enjoy. https://t.co/GaVJhbptR0\",\"source\":{\"type\":\"x_post\","
     "\"author\":\"thsottiaux\",\"url\":\"https://x.com/thsottiaux/status/2106131810921136451\"}},"
     "\"scheduled_reset\":null,\"active_watch\":null,\"stats\":{\"total\":57,"
     "\"last_reset_at\":\"2026-10-02T21:18:48.000Z\",\"days_since_last\":1.4,"
@@ -68,6 +68,8 @@ static void test_valid_feed(void)
     assert(data.latest.present && data.latest.kind == RESET_KIND_REGULAR);
     assert(!data.latest.observed);
     assert(strcmp(data.latest.id, "2106131810921136451") == 0);
+    assert(strcmp(data.latest.text, "Reset all propagated. Enjoy. https://t.co/GaVJhbptR0") == 0);
+    assert(!data.latest.text_truncated && !data.latest.text_has_non_ascii);
     assert(data.latest.announced_at == INT64_C(1790975928));
     assert(data.generated_at == INT64_C(1791096513));
     assert(!data.scheduled.present && !data.watch.present);
@@ -88,11 +90,16 @@ static void test_valid_feed(void)
     assert(parse_tree(root, &data));
     assert(data.latest.observed && data.latest.kind == RESET_KIND_BANKED);
     assert(data.scheduled.present && data.scheduled.has_time);
+    assert(data.scheduled.observed && strcmp(data.scheduled.id, "scheduled-123") == 0);
+    assert(strcmp(data.scheduled.text, "This is still awaiting execution evidence.") == 0);
+    assert(!data.scheduled.text_truncated && !data.scheduled.text_has_non_ascii);
     /* The passed date must not become a new executed reset. */
     assert(data.scheduled.scheduled_for < data.generated_at);
     assert(data.latest.announced_at == INT64_C(1790975928));
     assert(data.watch.present && data.watch.level == RESET_WATCH_STRONG);
     assert(data.watch.confidence_percent == 87);
+    assert(strcmp(data.watch.forecast_window, "soon") == 0);
+    assert(!data.watch.forecast_window_truncated && !data.watch.forecast_window_has_non_ascii);
     assert(data.watch.expires_at < data.generated_at); /* UI marks expiry. */
 
     cJSON_ReplaceItemInObjectCaseSensitive(item(body, "scheduled_reset"), "scheduled_for", cJSON_CreateNull());
@@ -108,6 +115,161 @@ static void test_valid_feed(void)
     char spaced[sizeof(fixture) + 10];
     snprintf(spaced, sizeof(spaced), " \n%s\t\r\n", fixture);
     assert(reset_feed_parse(spaced, strlen(spaced), &data));
+}
+
+static void test_announcement_text(void)
+{
+    /* Both status records retain independently bounded original content. */
+    const char *records[] = {"latest_reset", "scheduled_reset"};
+    const char *valid[] = {
+        "", "Plain original, 100%: #ff0000 not markup# <tag> https://example.com/",
+        "First line\nSecond line\r\nThird\tcolumn: \"quote\" \\slash",
+        "Reset \xe9\x87\x8d\xe7\xbd\xae \xf0\x9f\x98\x80 done.",
+    };
+    reset_feed_data_t data;
+    for (size_t r = 0; r < sizeof(records) / sizeof(records[0]); ++r) {
+        cJSON *root = cJSON_Parse(fixture);
+        cJSON *body = item(root, "data");
+        cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+        cJSON *record = item(body, records[r]);
+        for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i) {
+            cJSON_ReplaceItemInObjectCaseSensitive(record, "text", cJSON_CreateString(valid[i]));
+            assert(parse_tree(root, &data));
+            const char *retained = r ? data.scheduled.text : data.latest.text;
+            assert(strcmp(retained, valid[i]) == 0);
+            assert(!(r ? data.scheduled.text_truncated : data.latest.text_truncated));
+            assert((r ? data.scheduled.text_has_non_ascii : data.latest.text_has_non_ascii) == (i == 3));
+        }
+        char long_text[4097];
+        const size_t lengths[] = {255, 256, 257, sizeof(long_text) - 1};
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+            memset(long_text, 'a', lengths[i]);
+            long_text[lengths[i]] = '\0';
+            cJSON_ReplaceItemInObjectCaseSensitive(record, "text", cJSON_CreateString(long_text));
+            assert(parse_tree(root, &data));
+            const char *retained = r ? data.scheduled.text : data.latest.text;
+            size_t expected = lengths[i] > RESET_FEED_TEXT_MAX_BYTES ? RESET_FEED_TEXT_MAX_BYTES : lengths[i];
+            assert(strlen(retained) == expected);
+            assert(memcmp(retained, long_text, expected) == 0);
+            assert((r ? data.scheduled.text_truncated : data.latest.text_truncated) ==
+                   (lengths[i] > RESET_FEED_TEXT_MAX_BYTES));
+        }
+        /* Every possible cut inside two-, three- and four-byte codepoints. */
+        const char *codepoints[] = {"\xc3\xa9", "\xe9\x87\x8d", "\xf0\x9f\x98\x80"};
+        for (size_t i = 0; i < sizeof(codepoints) / sizeof(codepoints[0]); ++i) {
+            size_t width = strlen(codepoints[i]);
+            for (size_t prefix = RESET_FEED_TEXT_MAX_BYTES - width;
+                 prefix <= RESET_FEED_TEXT_MAX_BYTES; ++prefix) {
+                memset(long_text, 'a', prefix);
+                memcpy(long_text + prefix, codepoints[i], width);
+                long_text[prefix + width] = 'z';
+                long_text[prefix + width + 1] = '\0';
+                cJSON_ReplaceItemInObjectCaseSensitive(record, "text", cJSON_CreateString(long_text));
+                assert(parse_tree(root, &data));
+                const char *retained = r ? data.scheduled.text : data.latest.text;
+                size_t expected = prefix + width <= RESET_FEED_TEXT_MAX_BYTES ? prefix + width : prefix;
+                assert(strlen(retained) == expected);
+                assert(memcmp(retained, long_text, expected) == 0);
+                assert(r ? data.scheduled.text_truncated : data.latest.text_truncated);
+                assert(r ? data.scheduled.text_has_non_ascii : data.latest.text_has_non_ascii);
+            }
+        }
+        cJSON_ReplaceItemInObjectCaseSensitive(record, "text",
+            cJSON_CreateRaw("\"Escaped \\u91cd\\u7f6e \\ud83d\\ude00\\nline\\tend\""));
+        assert(parse_tree(root, &data));
+        assert(strcmp(r ? data.scheduled.text : data.latest.text,
+                      "Escaped \xe9\x87\x8d\xe7\xbd\xae \xf0\x9f\x98\x80\nline\tend") == 0);
+        cJSON_Delete(root);
+
+        for (int invalid_type = 0; invalid_type < 5; ++invalid_type) {
+            root = cJSON_Parse(fixture);
+            body = item(root, "data");
+            cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+            record = item(body, records[r]);
+            if (invalid_type == 0) cJSON_DeleteItemFromObjectCaseSensitive(record, "text");
+            else cJSON_ReplaceItemInObjectCaseSensitive(record, "text",
+                invalid_type == 1 ? cJSON_CreateNull() :
+                invalid_type == 2 ? cJSON_CreateNumber(7) :
+                invalid_type == 3 ? cJSON_CreateBool(true) : cJSON_CreateArray());
+            reject_tree(root);
+        }
+        const char *invalid_text[] = {
+            "control\x01", "back\bspace", "form\ffeed", "delete\x7f",
+            "bad\x80", "bad\xc0\xaf", "bad\xe0\x80\xaf", "bad\xed\xa0\x80",
+            "bad\xf4\x90\x80\x80", "bad\xf5\x80\x80\x80", "bad\xf0\x9f\x98",
+            "bad\xc2", "bad\xc2x", "bad\xe2\x82", "bad\xff",
+        };
+        for (size_t i = 0; i < sizeof(invalid_text) / sizeof(invalid_text[0]); ++i) {
+            root = cJSON_Parse(fixture);
+            body = item(root, "data");
+            cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+            cJSON_ReplaceItemInObjectCaseSensitive(item(body, records[r]), "text", cJSON_CreateString(invalid_text[i]));
+            reject_tree(root);
+        }
+        const char *invalid_escapes[] = {"\"\\u0000\"", "\"\\ud800\"", "\"\\udc00\"", "\"\\ud800\\u0041\""};
+        for (size_t i = 0; i < sizeof(invalid_escapes) / sizeof(invalid_escapes[0]); ++i) {
+            root = cJSON_Parse(fixture);
+            body = item(root, "data");
+            cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+            cJSON_ReplaceItemInObjectCaseSensitive(item(body, records[r]), "text", cJSON_CreateRaw(invalid_escapes[i]));
+            reject_tree(root);
+        }
+    }
+    /* A newer schedule remains a schedule; presenter decides which to feature. */
+    cJSON *root = cJSON_Parse(fixture);
+    cJSON *body = item(root, "data");
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+    cJSON_ReplaceItemInObjectCaseSensitive(item(body, "scheduled_reset"), "announced_at",
+                                         cJSON_CreateString("2026-10-03T12:00:00Z"));
+    assert(parse_tree(root, &data));
+    assert(data.scheduled.announced_at > data.latest.announced_at);
+    assert(strcmp(data.latest.text, "Reset all propagated. Enjoy. https://t.co/GaVJhbptR0") == 0);
+    assert(strcmp(data.scheduled.text, "This is still awaiting execution evidence.") == 0);
+    cJSON_Delete(root);
+}
+
+static void test_forecast_window(void)
+{
+    cJSON *root = cJSON_Parse(fixture);
+    cJSON *body = item(root, "data");
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "active_watch", cJSON_Parse(watch));
+    cJSON *prediction = item(body, "active_watch");
+    reset_feed_data_t data;
+    const char *valid[] = {"", "Maybe tomorrow\nNo confirmed date.", "\xe4\xb8\x8b\xe5\x91\xa8 \xf0\x9f\x98\x80"};
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i) {
+        cJSON_ReplaceItemInObjectCaseSensitive(prediction, "forecast_window", cJSON_CreateString(valid[i]));
+        assert(parse_tree(root, &data));
+        assert(strcmp(data.watch.forecast_window, valid[i]) == 0);
+        assert(!data.watch.forecast_window_truncated);
+        assert(data.watch.forecast_window_has_non_ascii == (i == 2));
+    }
+    char long_window[RESET_FEED_FORECAST_MAX_BYTES + 8];
+    for (size_t n = RESET_FEED_FORECAST_MAX_BYTES - 1; n <= RESET_FEED_FORECAST_MAX_BYTES + 1; ++n) {
+        memset(long_window, 'a', n);
+        long_window[n] = '\0';
+        cJSON_ReplaceItemInObjectCaseSensitive(prediction, "forecast_window", cJSON_CreateString(long_window));
+        assert(parse_tree(root, &data));
+        assert(strlen(data.watch.forecast_window) == (n > RESET_FEED_FORECAST_MAX_BYTES ? RESET_FEED_FORECAST_MAX_BYTES : n));
+        assert(data.watch.forecast_window_truncated == (n > RESET_FEED_FORECAST_MAX_BYTES));
+    }
+    memset(long_window, 'a', RESET_FEED_FORECAST_MAX_BYTES - 1);
+    strcpy(long_window + RESET_FEED_FORECAST_MAX_BYTES - 1, "\xf0\x9f\x98\x80");
+    cJSON_ReplaceItemInObjectCaseSensitive(prediction, "forecast_window", cJSON_CreateString(long_window));
+    assert(parse_tree(root, &data));
+    assert(strlen(data.watch.forecast_window) == RESET_FEED_FORECAST_MAX_BYTES - 1);
+    assert(data.watch.forecast_window_truncated && data.watch.forecast_window_has_non_ascii);
+    cJSON_Delete(root);
+    for (int invalid = 0; invalid < 5; ++invalid) {
+        root = cJSON_Parse(fixture);
+        body = item(root, "data");
+        cJSON_ReplaceItemInObjectCaseSensitive(body, "active_watch", cJSON_Parse(watch));
+        prediction = item(body, "active_watch");
+        if (invalid == 0) cJSON_DeleteItemFromObjectCaseSensitive(prediction, "forecast_window");
+        else cJSON_ReplaceItemInObjectCaseSensitive(prediction, "forecast_window",
+            invalid == 1 ? cJSON_CreateNull() : invalid == 2 ? cJSON_CreateNumber(2) :
+            invalid == 3 ? cJSON_CreateString("control\x01") : cJSON_CreateString("invalid\xc0\xaf"));
+        reject_tree(root);
+    }
 }
 
 static void test_stats(void)
@@ -451,6 +613,8 @@ static void test_mutated_input(void)
 int main(void)
 {
     test_valid_feed();
+    test_announcement_text();
+    test_forecast_window();
     test_timestamps();
     test_stats();
     test_invalid_feed();

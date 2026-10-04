@@ -12,8 +12,40 @@
 #define RESET_JSON_MAX_DEPTH 12U
 #define RESET_JSON_MAX_TOKENS 256U
 
+/* cJSON accepts raw string bytes without validating UTF-8. Reject malformed,
+ * overlong, surrogate and out-of-range sequences before they reach C strings. */
+static bool valid_utf8(const char *text, size_t length)
+{
+    for (size_t i = 0; i < length;) {
+        unsigned char lead = (unsigned char)text[i++];
+        if (lead < 0x80) continue;
+        unsigned remaining;
+        uint32_t codepoint;
+        uint32_t minimum;
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            remaining = 1; codepoint = lead & 0x1f; minimum = 0x80;
+        } else if (lead >= 0xe0 && lead <= 0xef) {
+            remaining = 2; codepoint = lead & 0x0f; minimum = 0x800;
+        } else if (lead >= 0xf0 && lead <= 0xf4) {
+            remaining = 3; codepoint = lead & 0x07; minimum = 0x10000;
+        } else {
+            return false;
+        }
+        if (remaining > length - i) return false;
+        while (remaining--) {
+            unsigned char next = (unsigned char)text[i++];
+            if ((next & 0xc0) != 0x80) return false;
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        if (codepoint < minimum || codepoint > 0x10ffff ||
+            (codepoint >= 0xd800 && codepoint <= 0xdfff)) return false;
+    }
+    return true;
+}
+
 static bool json_preflight(const char *json, size_t length)
 {
+    if (!valid_utf8(json, length)) return false;
     unsigned depth = 0;
     unsigned tokens = 0;
     bool quoted = false;
@@ -187,6 +219,31 @@ static bool valid_id(const char *id)
     return true;
 }
 
+static bool bounded_text(const cJSON *object, const char *key, char *out, size_t max_bytes,
+                         bool *truncated, bool *has_non_ascii)
+{
+    const char *text = string_field(object, key);
+    if (!text) return false;
+    size_t length = strlen(text); /* Bounded by the 16 KiB response limit. */
+    if (!valid_utf8(text, length)) return false;
+    *truncated = length > max_bytes;
+    *has_non_ascii = false;
+    /* Inspect even the tail beyond the retained bound. Font-specific fallback
+     * belongs to the presenter; no Unicode is silently removed or translated. */
+    for (size_t i = 0; i < length; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x80) *has_non_ascii = true;
+        if ((c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f) return false;
+    }
+    size_t copy_length = *truncated ? max_bytes : length;
+    /* If the first omitted byte is a continuation, exclude its entire
+     * codepoint. Valid UTF-8 guarantees this walk stops at its lead byte. */
+    while (copy_length && ((unsigned char)text[copy_length] & 0xc0) == 0x80) --copy_length;
+    memcpy(out, text, copy_length);
+    out[copy_length] = '\0';
+    return true;
+}
+
 static bool parse_latest(const cJSON *object, reset_announcement_t *out)
 {
     if (cJSON_IsNull(object)) return true;
@@ -194,7 +251,8 @@ static bool parse_latest(const cJSON *object, reset_announcement_t *out)
     const char *id = string_field(object, "id");
     if (!valid_id(id) || !kind_field(object, &out->kind) ||
         !timestamp_field(object, "announced_at", &out->announced_at) ||
-        !string_field(object, "text") || !valid_source(object)) return false;
+        !bounded_text(object, "text", out->text, RESET_FEED_TEXT_MAX_BYTES,
+                      &out->text_truncated, &out->text_has_non_ascii) || !valid_source(object)) return false;
     memcpy(out->id, id, strlen(id) + 1);
     out->observed = strcmp(string_field(field(object, "source"), "type"), "observed") == 0;
     out->present = true;
@@ -206,15 +264,19 @@ static bool parse_schedule(const cJSON *object, reset_schedule_t *out)
     if (cJSON_IsNull(object)) return true;
     if (!cJSON_IsObject(object)) return false;
     const char *status = string_field(object, "status");
+    const char *id = string_field(object, "id");
     const cJSON *date = field(object, "scheduled_for");
     if (!status || strcmp(status, "scheduled") != 0 ||
-        !valid_id(string_field(object, "id")) || !kind_field(object, &out->kind) ||
+        !valid_id(id) || !kind_field(object, &out->kind) ||
         !timestamp_field(object, "announced_at", &out->announced_at) ||
-        !string_field(object, "text") || !valid_source(object)) return false;
+        !bounded_text(object, "text", out->text, RESET_FEED_TEXT_MAX_BYTES,
+                      &out->text_truncated, &out->text_has_non_ascii) || !valid_source(object)) return false;
     if (!cJSON_IsNull(date)) {
         if (!timestamp_field(object, "scheduled_for", &out->scheduled_for)) return false;
         out->has_time = true;
     }
+    memcpy(out->id, id, strlen(id) + 1);
+    out->observed = strcmp(string_field(field(object, "source"), "type"), "observed") == 0;
     out->present = true;
     return true;
 }
@@ -239,7 +301,8 @@ static bool parse_watch(const cJSON *object, reset_watch_t *out)
     if (!timestamp_field(object, "observed_at", &out->observed_at) ||
         !timestamp_field(object, "expires_at", &out->expires_at) ||
         out->expires_at <= out->observed_at ||
-        !string_field(object, "forecast_window") ||
+        !bounded_text(object, "forecast_window", out->forecast_window, RESET_FEED_FORECAST_MAX_BYTES,
+                      &out->forecast_window_truncated, &out->forecast_window_has_non_ascii) ||
         !string_field(object, "text") || !valid_source(object)) return false;
     out->present = true;
     return true;
@@ -921,7 +984,9 @@ void reset_feed_resume(bool refresh_now)
 }
 
 #define RESET_RTC_MAGIC UINT32_C(0x52534632)
-#define RESET_RTC_VERSION 2U
+/* Version 3 retains bounded source/forecast text and scheduled source identity.
+ * Both this version and sizeof check reject pre-text layouts on wake. */
+#define RESET_RTC_VERSION 3U
 
 static uint32_t rtc_checksum(const reset_feed_rtc_state_t *state)
 {
@@ -933,6 +998,17 @@ static uint32_t rtc_checksum(const reset_feed_rtc_state_t *state)
         hash = (hash ^ bytes[i]) * UINT32_C(16777619);
     }
     return hash;
+}
+
+static bool valid_rtc_text(const char *text, size_t capacity)
+{
+    const char *end = memchr(text, '\0', capacity);
+    if (!end || !valid_utf8(text, (size_t)(end - text))) return false;
+    for (const char *p = text; p < end; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if ((c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f) return false;
+    }
+    return true;
 }
 
 bool reset_feed_export_rtc(reset_feed_rtc_state_t *out)
@@ -988,6 +1064,9 @@ bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state)
         state->error > RESET_FEED_ERROR_FORMAT || state->http_status < 0 || state->http_status > 599 ||
         state->last_checked_at < 0 || state->last_attempt_at < 0 ||
         state->hard_backoff_until < 0 || state->next_auto_at < 0 ||
+        !valid_rtc_text(state->data.latest.text, sizeof(state->data.latest.text)) ||
+        !valid_rtc_text(state->data.scheduled.text, sizeof(state->data.scheduled.text)) ||
+        !valid_rtc_text(state->data.watch.forecast_window, sizeof(state->data.watch.forecast_window)) ||
         (state->has_data && (state->last_checked_at == 0 ||
                             state->data.generated_at < INT64_C(1609459200) ||
                             state->data.generated_at >= INT64_C(4102444800)))) return false;

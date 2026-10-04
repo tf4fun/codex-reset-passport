@@ -47,19 +47,23 @@ Store reusable music and sound-effect sources in `music/`.
 - `fonts/reset_font_12.c` / `fonts/reset_font_16.c` are the firmware's `reset_font_12` / `reset_font_16`: 12/16 px, 4 bpp,
   uncompressed LVGL bitmap font, including printable ASCII and every fixed
   non-ASCII string in `main/reset_ui.c` and `main/reset_presenter.c`.
+- `fonts/reset_font_24.c` is a 25-glyph, 24px relative-time-only subset, derived
+  from the presenter formatter. It does not add a full-size CJK font.
 - `fonts/passport_reset_source.otf` is the matching reusable, renamed source
   subset, derived from Noto Sans CJK SC Regular 2.004, TTC face 2. Upstream:
   [Noto CJK](https://github.com/notofonts/noto-cjk). The source system TTC was
   `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`, SHA-256
   `b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a`.
-- Both font assets remain under the [SIL Open Font License 1.1](fonts/OFL.txt).
+- All font assets remain under the [SIL Open Font License 1.1](fonts/OFL.txt).
   Copyright 2014–2021 Adobe; upstream packaging also credits 2010–2012 Google.
   The source subset uses the new family name **Passport Reset UI**.
 - `fonts/reset_font_text.txt` records the actual string inventory. This font
   does not support arbitrary server strings, SSIDs, or personal names; the
-  application displays only bounded enums, timestamps, and local fixed text.
+  application checks each original announcement/forecast codepoint against the
+  active font, substitutes unsupported glyphs with `?`, and visibly flags it.
 - `main/CMakeLists.txt` compiles the C asset once. Chinese labels explicitly
-  select `reset_font_12` or `reset_font_16`; ASCII-only sizes use enabled Montserrat fonts.
+  select `reset_font_12`, `reset_font_16`, or the relative-time-only
+  `reset_font_24`; ASCII-only sizes use enabled Montserrat fonts.
 
 Reproduction uses Python `fonttools==4.61.1` and official `lv_font_conv@1.5.3`.
 The binary source subset is included, so normal regeneration needs no upstream
@@ -82,7 +86,8 @@ python3 tools/generate_reset_font.py \
 ```
 
 The generator derives the inventory from source, checks source-font coverage,
-renames the subset family, and invokes sizes 12/16 / bpp 4 / `--no-compress` with
+renames the subset family, and invokes sizes 12/16 plus the tiny 24px subset,
+all at bpp 4 / `--no-compress` with
 stable relative paths. Review the inventory and generated changes together.
 
 The actual LVGL host preview requires a C/C++ compiler, CMake, Python Pillow,
@@ -104,8 +109,12 @@ known-missing U+9F98 is rejected, audits the active font on each rendered label,
 and rejects clipped labels. Device rendering and internal heap remain separate
 hardware checks; neither this preview nor compilation establishes them.
 
-The v2.2 regeneration covers the hold-progress modal, release guard, and blocked
-provisioning labels in both 12 and 16 px assets (290 glyphs). The source subset
-SHA-256 is `a4bd342097ae88282d4ab3f8c9e313c098f50e9594fd4f95076cee8d6504854c`.
-The actual-render tool also emits a 25-fps hold GIF and an unlabeled fill-stage strip; see
-[the preview details](../tools/reset_ui_preview/README.md#v22-hold-to-sleep-preview).
+The v2.3 announcement/reader regeneration covers 123 fixed strings and 324
+codepoints in both 12/16px assets. The 24px font contains only 25 codepoints
+needed by the relative-age formatter. Source subset SHA-256:
+`fe18e600a2d7fa2373387f8fe32e70f088bcfc06021f94b416636544503f8cf4`.
+The host's font objects contain 23734/36322/5056 bytes of text/read-only data
+for 12/16/24px respectively (host object measurements, not final firmware sizes).
+The actual-render tool emits the three production-state-machine hold GIFs,
+original-text and all-page limit fixtures, and an unlabeled fill-stage strip;
+see [the preview details](../tools/reset_ui_preview/README.md).

@@ -12,6 +12,7 @@
 #include "reset_settings.h"
 #include "reset_controls.h"
 #include "reset_hold.h"
+#include "reset_idle.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_netif_sntp.h"
@@ -45,7 +46,8 @@ static reset_input_t convert_input(const input_t *input) {
     if (input->event == BSP_BTN_LONG) return RESET_INPUT_OK_LONG;
     return input->button == BSP_BTN_UP ? RESET_INPUT_UP : input->button == BSP_BTN_DOWN ? RESET_INPUT_DOWN : RESET_INPUT_OK;
 }
-static void cancel_sleep(reset_controls_t *controls, unsigned *phase) {
+static void cancel_sleep(reset_controls_t *controls, unsigned *phase, reset_idle_t *idle) {
+    reset_idle_defer_after_cancel_or_failure(idle, milliseconds());
     rtc_magic = 0;
     if (reset_power_cancel_deep_sleep() != ESP_OK) {
         ESP_LOGE(TAG, "Button/power rollback failed; restarting safely");
@@ -91,13 +93,16 @@ void app_main(void) {
     unsigned sleep_phase = 0, message = settings_error == ESP_OK ? 0 : 1;
     int battery = -1;
     reset_input_gate_t input_gate = {0};
+    reset_input_cutoff_t input_cutoff = {0};
     reset_hold_t hold; reset_hold_init(&hold);
+    reset_idle_t idle_policy = {0};
+    unsigned reading_page = 0, reading_page_count = 1;
     reset_direction_tap_t direction[2] = {0};
     reset_ui_page_t hold_page = RESET_UI_HOME;
     for (;;) {
         input_t input;
         bool input_was_ready = atomic_load(&input_ready);
-        bool got_input = input_queue && xQueueReceive(input_queue, &input, pdMS_TO_TICKS(hold.visible ? 40 : 100)) == pdTRUE;
+        bool got_input = input_queue && xQueueReceive(input_queue, &input, pdMS_TO_TICKS(hold.active ? 40 : 100)) == pdTRUE;
         if (!input_queue) vTaskDelay(pdMS_TO_TICKS(100));
         /* A queued callback racing a gate transition belongs to the consumed
          * wake/cancel gesture, even if this iteration finishes release gating. */
@@ -125,13 +130,20 @@ void app_main(void) {
         reset_action_t action = RESET_ACTION_NONE;
         if (atomic_exchange(&input_overflow, false)) {
             reset_hold_cancel(&hold);
-            if (sleep_phase) cancel_sleep(&controls, &sleep_phase);
+            if (sleep_phase) cancel_sleep(&controls, &sleep_phase, &idle_policy);
             atomic_store(&input_ready, false);
             input_gate.release_seen = false;
             xQueueReset(input_queue);
             got_input = false;
         }
+        bool user_activity = false;
+        unsigned drained_inputs = 0;
+        do {
+        action = RESET_ACTION_NONE;
+        now_ms = milliseconds();
+        if (got_input && !reset_input_cutoff_accepts(&input_cutoff, input.at_ms)) got_input = false;
         if (got_input) {
+            user_activity = true;
             bool wake_only = applied_brightness == 0;
             last_input = now_ms;
             if (wake_only) {
@@ -142,12 +154,20 @@ void app_main(void) {
             } else if (sleep_phase) {
                 if (input.event == BSP_BTN_PRESS)
                     action = RESET_ACTION_CANCEL_SLEEP;
+            } else if (hold.cancelling) {
+                /* The unwind/quarantine owns every key: never leak a late
+                 * release into a navigation tap or restart a Confirm gesture. */
+                direction[0].pressed = direction[1].pressed = false;
+                if (input.event == BSP_BTN_PRESS)
+                    reset_hold_press(&hold, input.at_ms, wifi.provisioning || !buttons_ok);
+                else if (input.event == BSP_BTN_RELEASE)
+                    (void)reset_hold_release(&hold, input.at_ms, now_ms);
             } else if (input.button == BSP_BTN_OK) {
                 if (input.event == BSP_BTN_PRESS) {
                     hold_page = controls.page;
                     reset_hold_press(&hold, input.at_ms, wifi.provisioning || !buttons_ok);
                 } else if (input.event == BSP_BTN_RELEASE) {
-                    reset_hold_event_t result = reset_hold_release(&hold, input.at_ms);
+                    reset_hold_event_t result = reset_hold_release(&hold, input.at_ms, now_ms);
                     if (result == RESET_HOLD_TAP)
                         action = reset_controls_handle(&controls, RESET_INPUT_OK);
                 }
@@ -161,30 +181,27 @@ void app_main(void) {
                 }
             }
         }
-        if (hold.visible && (controls.page != hold_page || (wifi.provisioning && !hold.blocked)))
-            reset_hold_cancel(&hold);
-        if (hold.visible) {
-            bool released = false;
-            if (hold.waiting_release && !hold.pressed) {
-                int mv = bsp_button_read_mv();
-                released = mv >= BSP_BTN_RELEASE_MIN_MV && mv <= BSP_BTN_RELEASE_MAX_MV;
-            }
-            if (reset_hold_tick(&hold, now_ms, released) == RESET_HOLD_SLEEP)
-                action = RESET_ACTION_SLEEP;
-        }
         {
                 switch (action) {
+                case RESET_ACTION_READING_OPEN: reading_page = 0; break;
+                case RESET_ACTION_READING_PREVIOUS:
+                    reading_page = (reading_page + reading_page_count - 1) % reading_page_count;
+                    break;
+                case RESET_ACTION_READING_NEXT:
+                    reading_page = (reading_page + 1) % reading_page_count;
+                    break;
                 case RESET_ACTION_REFRESH:
                     if (!reset_feed_request_refresh()) throttle_until = now_ms + 5000;
                     break;
                 case RESET_ACTION_CHANGE_SETTING:
                     if (controls.selected == 2) { draft_offset = settings.utc_offset_minutes; controls.page = RESET_UI_TIMEZONE; }
-                    else if (controls.selected == 4) controls.page = RESET_UI_SETUP;
+                    else if (controls.selected == 5) controls.page = RESET_UI_SETUP;
                     else {
                         reset_settings_t next = settings;
                         if (controls.selected == 0) next.wifi_enabled = !next.wifi_enabled;
                         else if (controls.selected == 1) next.interval_minutes = next.interval_minutes == 5 ? 15 : next.interval_minutes == 15 ? 30 : next.interval_minutes == 30 ? 60 : 5;
-                        else next.brightness = next.brightness == 20 ? 45 : next.brightness == 45 ? 75 : 20;
+                        else if (controls.selected == 3) next.brightness = next.brightness == 20 ? 45 : next.brightness == 45 ? 75 : 20;
+                        else if (controls.selected == 4) next.sleep_minutes = next.sleep_minutes == 5 ? 10 : next.sleep_minutes == 10 ? 30 : next.sleep_minutes == 30 ? 0 : 5;
                         if (reset_settings_save(&next) == ESP_OK) {
                             settings = next;
                             (void)reset_feed_set_auto_interval(settings.interval_minutes);
@@ -208,26 +225,81 @@ void app_main(void) {
                     break;
                 case RESET_ACTION_STOP_SETUP: (void)reset_wifi_stop_provisioning(); break;
                 case RESET_ACTION_CLEAR: (void)reset_wifi_clear_credentials(); break;
-                case RESET_ACTION_SLEEP:
-                    if (wifi.provisioning || !buttons_ok) {
-                        controls.page = RESET_UI_SETTINGS; message = 2; message_until = now_ms + 6000;
-                    } else { controls.page = RESET_UI_SLEEP_WAIT; sleep_phase = 1; sleep_started = now_ms; }
-                    break;
-                case RESET_ACTION_CANCEL_SLEEP: cancel_sleep(&controls, &sleep_phase); break;
+                case RESET_ACTION_CANCEL_SLEEP: cancel_sleep(&controls, &sleep_phase, &idle_policy); break;
                 default: break;
                 }
+        }
+        /* Drain already-queued releases before rendering a newly visible
+         * hold: a delayed short tap must never flash the sleep popup. */
+        ++drained_inputs;
+        got_input = input_was_ready && atomic_load(&input_ready) && input_queue &&
+                    xQueueReceive(input_queue, &input, 0) == pdTRUE;
+        } while (got_input && drained_inputs < 8);
+        if (got_input) {
+            /* A sustained event storm must not keep the UI task unbounded or
+             * leave a partially observed gesture armed. */
+            reset_hold_cancel(&hold);
+            if (sleep_phase) cancel_sleep(&controls, &sleep_phase, &idle_policy);
+            atomic_store(&input_ready, false);
+            input_gate.release_seen = false;
+            direction[0].pressed = direction[1].pressed = false;
+            xQueueReset(input_queue);
+        }
+        now_ms = milliseconds();
+        if (hold.active && (controls.page != hold_page || (wifi.provisioning && !hold.blocked)))
+            reset_hold_cancel(&hold);
+        if (hold.active) {
+            bool was_cancelling = hold.cancelling;
+            bool released = false;
+            if (hold.cancelling || (hold.waiting_release && !hold.pressed)) {
+                int mv = bsp_button_read_mv();
+                released = mv >= BSP_BTN_RELEASE_MIN_MV && mv <= BSP_BTN_RELEASE_MAX_MV;
+            }
+            /* ADC can block while callbacks enqueue more input. Fence the
+             * entire observed cancellation interval, never its stale start. */
+            now_ms = milliseconds();
+            reset_hold_event_t hold_result = reset_hold_tick(&hold, now_ms, released);
+            if (was_cancelling && !hold.active) {
+                reset_input_cutoff_mark(&input_cutoff, now_ms);
+                direction[0].pressed = direction[1].pressed = false;
+            }
+            if (hold_result == RESET_HOLD_SLEEP) {
+                if (wifi.provisioning || !buttons_ok) {
+                    controls.page = RESET_UI_SETTINGS; message = 2; message_until = now_ms + 6000;
+                } else {
+                    controls.page = RESET_UI_SLEEP_WAIT; sleep_phase = 1; sleep_started = now_ms;
+                }
+            }
+        }
+        bool idle_keys_released = false;
+        if (!sleep_phase && buttons_ok && atomic_load(&input_ready) && !hold.active) {
+            int mv = bsp_button_read_mv();
+            idle_keys_released = mv >= BSP_BTN_RELEASE_MIN_MV && mv <= BSP_BTN_RELEASE_MAX_MV;
+        }
+        /* Only button activity resets idle. Pairing/held keys/gesture handling
+         * pause it; periodic API checks never keep an unused device awake. */
+        now_ms = milliseconds();
+        bool queued_input = input_queue && uxQueueMessagesWaiting(input_queue) > 0;
+        bool idle_paused = sleep_phase || wifi.provisioning || hold.active ||
+                           !atomic_load(&input_ready) || !idle_keys_released || queued_input;
+        reset_idle_observe(&idle_policy, now_ms, user_activity, idle_paused);
+        if (!sleep_phase && reset_idle_due(&idle_policy, settings.sleep_minutes, now_ms)) {
+            controls.page = RESET_UI_SLEEP_WAIT;
+            controls.editing = false;
+            sleep_phase = 1;
+            sleep_started = now_ms;
         }
         if (sleep_phase == 1) {
             if (reset_feed_pause_and_wait(0)) {
                 if (reset_wifi_suspend() == ESP_OK) { sleep_phase = 2; sleep_started = now_ms; }
-                else { cancel_sleep(&controls, &sleep_phase); message = 2; message_until = now_ms + 6000; }
+                else { cancel_sleep(&controls, &sleep_phase, &idle_policy); message = 2; message_until = now_ms + 6000; }
             } else if (now_ms - sleep_started > 35000) {
-                cancel_sleep(&controls, &sleep_phase); message = 2; message_until = now_ms + 6000;
+                cancel_sleep(&controls, &sleep_phase, &idle_policy); message = 2; message_until = now_ms + 6000;
             }
         } else if (sleep_phase == 2) {
             if (wifi.suspended && wifi.radio_stopped) sleep_phase = 3;
             else if (now_ms - sleep_started > 8000) {
-                cancel_sleep(&controls, &sleep_phase); message = 2; message_until = now_ms + 6000;
+                cancel_sleep(&controls, &sleep_phase, &idle_policy); message = 2; message_until = now_ms + 6000;
             }
         }
         /* No timer wake and no background updates during actual deep sleep. */
@@ -237,35 +309,45 @@ void app_main(void) {
                 rtc_magic = RTC_MAGIC;
                 (void)reset_power_enter_deep_sleep(); /* Only pre-terminal errors return. */
             }
-            cancel_sleep(&controls, &sleep_phase); message = 2; message_until = now_ms + 6000;
+            cancel_sleep(&controls, &sleep_phase, &idle_policy); message = 2; message_until = now_ms + 6000;
         }
         uint64_t idle = now_ms - last_input;
         int backlight = idle >= 120000 ? 0 : idle >= 30000 ? 8 : settings.brightness;
-        if (wifi.provisioning || sleep_phase || hold.visible || controls.page >= RESET_UI_SETTINGS) backlight = settings.brightness;
+        if (wifi.provisioning || sleep_phase || hold.active) backlight = settings.brightness;
         if (backlight != applied_brightness) { bsp_display_backlight(backlight); applied_brightness = backlight; }
         reset_feed_set_ready(settings.wifi_enabled && wifi.connected && !wifi.provisioning && !wifi.suspended, atomic_load(&clock_ready));
-        reset_feed_snapshot_t feed = {0};
+        static reset_feed_snapshot_t feed; /* Main-owner snapshot, not a large task-stack frame. */
         reset_feed_get_snapshot(&feed);
-        if (now_ms >= next_battery && !sleep_phase && !hold.visible) { battery = bsp_battery_soc(); next_battery = now_ms + 60000; }
+        if (now_ms >= next_battery && !sleep_phase && !hold.active) { battery = bsp_battery_soc(); next_battery = now_ms + 60000; }
         reset_presenter_state_t state = {
             .page = controls.page, .connected = wifi.connected, .has_credentials = wifi.has_credentials,
             .provisioning = wifi.provisioning, .wifi_error = wifi.state == RESET_WIFI_ERROR,
+            .wifi_initialized = wifi.initialized, .wifi_connecting = wifi.state == RESET_WIFI_CONNECTING,
+            .wifi_attempts = wifi.attempts, .wifi_disconnect_reason = wifi.disconnect_reason,
+            .wifi_last_error = wifi.last_error, .wifi_persistence_error = wifi.persistence_error,
             .clock_ready = atomic_load(&clock_ready), .refresh_throttled = now_ms < throttle_until,
             .battery = battery, .provisioning_seconds = wifi.provisioning_seconds_left,
             .now = time(NULL), .settings = settings, .settings_editing = controls.editing,
             .selected_setting = controls.selected, .draft_utc_offset = draft_offset,
+            .reading_page = reading_page,
             .sleep_phase = sleep_phase, .message = now_ms < message_until ? message : 0,
             .restored_cache = restored, .radio_stopped = wifi.radio_stopped,
             .radio_control_pending = wifi.control_pending || (!wifi.initialized && wifi.state != RESET_WIFI_ERROR),
         };
-        reset_ui_model_t model;
+        static reset_ui_model_t model;
         reset_presenter_build(&feed, &state, &model);
         model.hold_visible = hold.visible;
         model.hold_progress = hold.progress1000;
         model.hold_armed = hold.armed;
         model.hold_blocked = hold.blocked;
         model.hold_released = hold.waiting_release && !hold.pressed;
-        if (bsp_lvgl_lock(100)) { reset_ui_update(&model); bsp_lvgl_unlock(); }
+        if (bsp_lvgl_lock(100)) {
+            reset_ui_update(&model);
+            reading_page_count = reset_ui_reading_page_count();
+            if (!reading_page_count) reading_page_count = 1;
+            if (reading_page >= reading_page_count) reading_page = reading_page_count - 1;
+            bsp_lvgl_unlock();
+        }
         static uint64_t next_log;
         if (now_ms >= next_log) {
             next_log = now_ms + 60000;

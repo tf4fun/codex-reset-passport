@@ -42,21 +42,25 @@
 
 ### Codex 重置观察应用字体子集
 
-- `fonts/reset_font_12.c` / `fonts/reset_font_16.c` 是固件使用的 `reset_font_16`：12/16 px、4 bpp、
+- `fonts/reset_font_12.c` / `fonts/reset_font_16.c` 是固件使用的 `reset_font_12` / `reset_font_16`：12/16 px、4 bpp、
   不压缩的 LVGL 位图字体，覆盖可打印 ASCII 以及 `main/reset_ui.c` 和
   `main/reset_presenter.c` 中的全部固定非 ASCII 文本。
+- `fonts/reset_font_24.c` 只含相对时间所需的 25 个 24px 字形，直接从展示模型的
+  格式函数提取，不引入完整大字号 CJK 字库。
 - `fonts/passport_reset_source.otf` 是对应的可复用源字体子集，已重命名。
   它来自 Noto Sans CJK SC Regular 2.004，TTC 中第 2 号字体。
   上游：[Noto CJK](https://github.com/notofonts/noto-cjk)。原系统字体路径为
   `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`，SHA-256 为
   `b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a`。
-- 两个字体资源均遵循 [SIL Open Font License 1.1](fonts/OFL.txt)。
+- 所有字体资源均遵循 [SIL Open Font License 1.1](fonts/OFL.txt)。
   版权属于 2014–2021 Adobe；上游软件包也标注了 2010–2012 Google。
   子集使用新的字体家族名称 **Passport Reset UI**。
 - `fonts/reset_font_text.txt` 记录真实文本清单。该字体不支持任意服务端文字、
-  SSID 或人名；应用仅显示有界枚举、时间戳和本地固定文本。
+  SSID 或人名；应用逐字检查公告/预测原文是否有实际字形，将缺字替换为 `?`，
+  并在界面明确提示。
 - `main/CMakeLists.txt` 仅编译一次 C 字体资源；中文标签显式选择
-  `reset_font_12` 或 `reset_font_16`，仅显示 ASCII 的字号使用已启用的 Montserrat 字体。
+  `reset_font_12`、`reset_font_16` 或仅供相对时间使用的 `reset_font_24`；
+  仅显示 ASCII 的字号使用已启用的 Montserrat 字体。
 
 复现使用 Python `fonttools==4.61.1` 和官方 `lv_font_conv@1.5.3`。
 仓库已包含二进制源子集，常规重新生成无需下载上游字体。在隔离环境安装工具后执行：
@@ -78,7 +82,8 @@ python3 tools/generate_reset_font.py \
 ```
 
 生成器从源代码提取清单、检查源字体覆盖、重命名字体家族，并使用稳定的相对路径、
-12/16 px、4 bpp 和 `--no-compress` 参数生成。请一起审查清单和字体变更。
+12/16 px 加极小 24px 子集，均用 4 bpp 和 `--no-compress` 参数生成。
+请一起审查清单和字体变更。
 
 真实 LVGL 主机预览需要 C/C++ 编译器、CMake、Python Pillow 以及已解析的 LVGL
 托管组件源码。它直接编译原版 `reset_ui.c`、展示模型和有界数据解析器：
@@ -95,8 +100,10 @@ PNG、标明模拟状态的拼图、字形/裁剪检查结果和源文件哈希�
 缺失字符 U+9F98 确实被拒绝，检查各标签当前实际字体，并拒绝被裁剪的标签。
 设备实际显示和内部堆内存仍需单独检查，预览和编译均不能替代硬件验收。
 
-v2.2 重新生成的 12/16 px 字体均覆盖长按进度弹窗、松键等待及配网阻止休眠
-提示（290 个字形）。源字体子集 SHA-256 为
-`a4bd342097ae88282d4ab3f8c9e313c098f50e9594fd4f95076cee8d6504854c`。
-实际渲染工具同时输出 25 fps 长按动图及 不带数字标注的关键帧拼图；参见
-[预览说明](../tools/reset_ui_preview/README.zh_CN.md#v22-长按休眠预览)。
+v2.3 公告/正文重新生成的 12/16px 字体覆盖 123 条固定字符串和 324 个码点；
+24px 字体只含相对时间格式函数所需的 25 个码点。源字体子集 SHA-256：
+`fe18e600a2d7fa2373387f8fe32e70f088bcfc06021f94b416636544503f8cf4`。
+主机字体目标文件的文本/只读数据分别为 23734/36322/5056 字节（12/16/24px）；
+这是主机目标文件测量，不是最终固件大小。
+真实渲染工具输出三段生产状态机长按 GIF、原文及全部页数上限场景，以及无数字
+关键帧拼图；参见[预览说明](../tools/reset_ui_preview/README.zh_CN.md)。

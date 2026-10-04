@@ -20,6 +20,14 @@ TEXT_INVENTORY = FONT_DIR / "reset_font_text.txt"
 FONT_SOURCE = FONT_DIR / "passport_reset_source.otf"
 FONT_OUTPUT = FONT_DIR / "reset_font_16.c"
 FONT_SIZES = (12, 16)
+def hero_inventory() -> str:
+    """Derive the tiny 24px font from the relative-age formatter, not guesses."""
+    source = (ROOT / "main/reset_presenter.c").read_text(encoding="utf-8")
+    source = source[source.index("static void relative("):source.index("#define SET")]
+    chars = set("0123456789-")
+    for token in re.findall(r'"(?:\\.|[^"\\])*"', source):
+        chars.update(re.sub(r"%lld", "", ast.literal_eval(token)))
+    return "".join(sorted(chars))
 
 
 def inventory() -> list[str]:
@@ -77,9 +85,10 @@ def main() -> None:
     parser.add_argument("--check", action="store_true",
                         help="Check source/inventory coverage without rewriting files")
     args = parser.parse_args()
+    hero_text = hero_inventory()
     lines = inventory()
     text = "\n".join(lines) + "\n"
-    codepoints = set(range(0x20, 0x7F)) | {ord(c) for c in text if ord(c) >= 0x20}
+    codepoints = set(range(0x20, 0x7F)) | {ord(c) for c in text if ord(c) >= 0x20} | set(map(ord, hero_text))
     if args.check:
         if TEXT_INVENTORY.read_text(encoding="utf-8") != text:
             raise SystemExit("UI inventory changed: regenerate the font")
@@ -92,7 +101,10 @@ def main() -> None:
             raise SystemExit("Generated font is missing: " + ", ".join(f"U+{c:04X}" for c in missing))
         if 0x9F98 in coverage:
             raise SystemExit("Known-missing U+9F98 unexpectedly appears in generated font")
-        print(f"PASS: {len(lines)} fixed non-ASCII strings, {len(codepoints)} glyphs covered by generated C cmaps")
+        hero_coverage = generated_coverage((FONT_DIR / "reset_font_24.c").read_text(encoding="utf-8"))
+        if set(map(ord, hero_text)) - hero_coverage:
+            raise SystemExit("Hero font coverage failed")
+        print(f"PASS: {len(lines)} fixed non-ASCII strings, {len(codepoints)} glyphs covered; limited 24px hero subset checked")
         return
     from fontTools.ttLib import TTFont
     source = args.source_font or FONT_SOURCE
@@ -128,10 +140,10 @@ def main() -> None:
     if version != "1.5.3":
         raise SystemExit(f"Expected lv_font_conv 1.5.3; got {version}")
     symbols = "".join(chr(c) for c in sorted(codepoints) if c >= 0x7f)
-    for size in FONT_SIZES:
+    for size in (*FONT_SIZES, 24):
         output = FONT_DIR / f"reset_font_{size}.c"
         command = [args.converter, "--font", str(FONT_SOURCE.relative_to(ROOT)),
-                   "--range", "0x20-0x7E", "--symbols", symbols,
+                   "--symbols=" + (hero_text if size == 24 else "".join(chr(c) for c in sorted(codepoints))),
                    "--size", str(size), "--bpp", "4", "--format", "lvgl", "--no-compress",
                    "--lv-font-name", f"reset_font_{size}", "--lv-include", "lvgl.h",
                    "--output", str(output.relative_to(ROOT))]
@@ -140,7 +152,7 @@ def main() -> None:
         output.write_text("/* Copyright 2014-2021 Adobe. Font asset licensed under SIL OFL 1.1.\n"
                                " * Source: Noto Sans CJK SC 2.004. See OFL.txt and assets/README.md. */\n" + body,
                                encoding="utf-8")
-        print(f"Generated {len(codepoints)} glyphs: {output.relative_to(ROOT)}")
+        print(f"Generated {len(hero_text) if size == 24 else len(codepoints)} glyphs: {output.relative_to(ROOT)}")
     print("Source subset SHA-256:", hashlib.sha256(FONT_SOURCE.read_bytes()).hexdigest())
 
 

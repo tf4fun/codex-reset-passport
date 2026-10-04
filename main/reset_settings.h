@@ -2,11 +2,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#define RESET_DEFAULT_SLEEP_MINUTES 5
 typedef struct {
     bool wifi_enabled;
     uint16_t interval_minutes;
     int16_t utc_offset_minutes; /* Explicit fixed offset, never inferred; no DST. */
     uint8_t brightness;
+    uint16_t sleep_minutes; /* 0 = off; otherwise 5, 10, or 30 idle minutes. */
 } reset_settings_t;
 void reset_settings_defaults(reset_settings_t *settings);
 bool reset_settings_valid(const reset_settings_t *settings);

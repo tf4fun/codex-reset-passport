@@ -8,15 +8,19 @@ int main(void) {
     assert(reset_controls_handle(&s, RESET_INPUT_UP) == RESET_ACTION_NONE && s.page == RESET_UI_SETTINGS);
     assert(!s.editing);
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_NONE && s.editing);
-    reset_controls_handle(&s, RESET_INPUT_UP); assert(s.selected == 5);
+    reset_controls_handle(&s, RESET_INPUT_UP); assert(s.selected == 6);
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_NONE);
     assert(s.page == RESET_UI_HOME && !s.editing); /* Explicit return row. */
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_READING_OPEN && s.page == RESET_UI_READING);
+    assert(reset_controls_handle(&s, RESET_INPUT_UP) == RESET_ACTION_READING_PREVIOUS);
+    assert(reset_controls_handle(&s, RESET_INPUT_DOWN) == RESET_ACTION_READING_NEXT);
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_NONE && s.page == RESET_UI_HOME);
+    reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_OVERVIEW);
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_REFRESH);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_STATS);
-    reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_DETAILS);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_SETTINGS);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_HOME);
-    const reset_ui_page_t pages[] = {RESET_UI_HOME, RESET_UI_STATS, RESET_UI_DETAILS,
+    const reset_ui_page_t pages[] = {RESET_UI_HOME, RESET_UI_OVERVIEW, RESET_UI_STATS, RESET_UI_READING,
         RESET_UI_SETTINGS, RESET_UI_TIMEZONE, RESET_UI_SETUP, RESET_UI_CLEAR};
     for (unsigned i = 0; i < sizeof(pages)/sizeof(pages[0]); ++i) {
         s = (reset_controls_t){.page = pages[i], .editing = true};
@@ -63,6 +67,28 @@ int main(void) {
     assert(!reset_direction_release(&down, 1500)); /* Held direction is not a tap. */
     reset_direction_press(&down, 2000);
     assert(!reset_direction_release(&down, 1999));
+
+    /* Cancellation ended after a delayed ADC observation at1640. Events
+     * queued during that sample must not navigate or become Confirm taps. */
+    reset_input_cutoff_t cutoff = {0};
+    assert(reset_input_cutoff_accepts(&cutoff, 0));
+    reset_input_cutoff_mark(&cutoff, 1640);
+    assert(!reset_input_cutoff_accepts(&cutoff, 1540));
+    assert(!reset_input_cutoff_accepts(&cutoff, 1620));
+    assert(!reset_input_cutoff_accepts(&cutoff, 1640));
+    assert(reset_input_cutoff_accepts(&cutoff, 1641));
+    reset_input_cutoff_mark(&cutoff, 1530); /* Never move a fence backwards. */
+    assert(cutoff.through_ms == 1640);
+    s = (reset_controls_t){.page = RESET_UI_SETTINGS, .editing = true, .selected = 0};
+    down = (reset_direction_tap_t){0};
+    if (reset_input_cutoff_accepts(&cutoff, 1540)) reset_direction_press(&down, 1540);
+    if (reset_input_cutoff_accepts(&cutoff, 1620) && reset_direction_release(&down, 1620))
+        (void)reset_controls_handle(&s, RESET_INPUT_DOWN);
+    assert(s.selected == 0);
+    reset_direction_press(&down, 1700);
+    assert(reset_input_cutoff_accepts(&cutoff, 1780) && reset_direction_release(&down, 1780));
+    (void)reset_controls_handle(&s, RESET_INPUT_DOWN);
+    assert(s.selected == 1); /* A genuinely new tap still works. */
 
     reset_settings_t settings; reset_settings_defaults(&settings); assert(reset_settings_valid(&settings));
     settings.interval_minutes = 1; assert(!reset_settings_valid(&settings));

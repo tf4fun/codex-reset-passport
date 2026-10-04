@@ -81,6 +81,14 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_reset_hold.c main/reset_hold.c -o "${test_dir}/test_reset_hold"
     "${test_dir}/test_reset_hold"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -DESP_PLATFORM \
+        -Itests/reset_settings_stubs -Itests/bsp_stubs -Imain \
+        tests/test_reset_idle.c main/reset_idle.c main/reset_settings.c \
+        -o "${test_dir}/test_reset_idle"
+    "${test_dir}/test_reset_idle"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_reset_text.c main/reset_text.c -o "${test_dir}/test_reset_text"
+    "${test_dir}/test_reset_text"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Itests/reset_wifi_stubs -Imain \
         tests/test_reset_wifi.c -o "${test_dir}/test_reset_wifi"
     "${test_dir}/test_reset_wifi"

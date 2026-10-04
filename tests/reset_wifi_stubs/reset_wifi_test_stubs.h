@@ -9,7 +9,9 @@ typedef int esp_err_t;
 #define ESP_FAIL -1
 #define ESP_ERR_NO_MEM 0x101
 #define ESP_ERR_INVALID_STATE 0x103
+#define ESP_ERR_INVALID_SIZE 0x104
 #define ESP_ERR_TIMEOUT 0x107
+#define ESP_ERR_WIFI_NOT_INIT 0x3001
 #define ESP_ERR_WIFI_NOT_STARTED 0x3002
 const char *esp_err_to_name(esp_err_t error);
 void test_log(const char *tag, const char *format, ...);
@@ -131,10 +133,11 @@ typedef enum {
     ESP_BLUFI_EVENT_RECV_STA_SSID, ESP_BLUFI_EVENT_RECV_STA_PASSWD,
     ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP, ESP_BLUFI_EVENT_GET_WIFI_STATUS,
     ESP_BLUFI_EVENT_GET_WIFI_LIST, ESP_BLUFI_EVENT_RECV_SLAVE_DISCONNECT_BLE,
-    ESP_BLUFI_EVENT_SET_WIFI_OPMODE,
+    ESP_BLUFI_EVENT_SET_WIFI_OPMODE, ESP_BLUFI_EVENT_REPORT_ERROR,
 } esp_blufi_cb_event_t;
 typedef struct {
     struct { int state; } init_finish;
+    struct { int state; } report_error;
     struct { int op_mode; } wifi_mode;
     struct { uint8_t *ssid; int ssid_len; } sta_ssid;
     struct { uint8_t *passwd; int passwd_len; } sta_passwd;

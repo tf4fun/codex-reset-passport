@@ -6,6 +6,8 @@
 
 #define RESET_FEED_URL "https://codex-resets.com/api/v1/status"
 #define RESET_FEED_BODY_LIMIT (16U * 1024U)
+#define RESET_FEED_TEXT_MAX_BYTES 256U
+#define RESET_FEED_FORECAST_MAX_BYTES 96U
 /* Client policy, not a published upstream rate limit. */
 #define RESET_FEED_FAILURE_BACKOFF_MS UINT64_C(300000)
 #define RESET_FEED_MANUAL_DEBOUNCE_MS UINT64_C(30000)
@@ -31,6 +33,16 @@ typedef struct {
     reset_kind_t kind;
     int64_t announced_at;       /* UTC epoch seconds; announcement, not quota. */
     char id[65];
+    /* Original valid UTF-8, never a translation or executable instruction.
+     * Always NUL-terminated at a complete codepoint boundary. At most 256 bytes
+     * survive; text_truncated requires an explicit excerpt indicator in the UI.
+     * ASCII controls other than LF/CR/TAB reject the response, including DEL.
+     * text_has_non_ascii is advisory, NOT a guarantee of font glyph coverage:
+     * the UI must check every codepoint, safely substitute missing glyphs and
+     * label any fallback. Empty text is valid, distinct from a missing record. */
+    char text[RESET_FEED_TEXT_MAX_BYTES + 1U];
+    bool text_truncated;
+    bool text_has_non_ascii;
 } reset_announcement_t;
 
 typedef struct {
@@ -39,6 +51,12 @@ typedef struct {
     int64_t announced_at;
     bool has_time;
     int64_t scheduled_for;
+    bool observed;
+    char id[65];
+    /* Same bounded original-text contract as reset_announcement_t. */
+    char text[RESET_FEED_TEXT_MAX_BYTES + 1U];
+    bool text_truncated;
+    bool text_has_non_ascii;
 } reset_schedule_t;
 
 typedef struct {
@@ -47,6 +65,11 @@ typedef struct {
     int confidence_percent;    /* -1 means not supplied. */
     int64_t observed_at;
     int64_t expires_at;
+    /* Bounded original wording, not a timestamp or confirmed reset time.
+     * Same UTF-8 / control / font-fallback contract as announcement text. */
+    char forecast_window[RESET_FEED_FORECAST_MAX_BYTES + 1U];
+    bool forecast_window_truncated;
+    bool forecast_window_has_non_ascii;
 } reset_watch_t;
 
 typedef struct {
@@ -115,8 +138,10 @@ typedef struct {
     uint32_t auto_interval_minutes;
 } reset_feed_snapshot_t;
 
-/* Pure bounded parser: failure leaves *out unchanged. No supplied text is
- * rendered; only validated enums, times, bounded IDs and numeric stats survive. */
+/* Pure bounded parser: failure leaves *out unchanged. Requires valid UTF-8
+ * JSON; required text must be a string (empty is allowed, null is not).
+ * Only validated values and bounded source text survive. Check font coverage;
+ * render as plain data with markup/recolor disabled, never as a format string. */
 bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out);
 bool reset_feed_parse_timestamp(const char *text, int64_t *epoch_seconds);
 bool reset_feed_parse_retry_after(const char *text, uint32_t *seconds);
@@ -143,7 +168,8 @@ void reset_feed_poll_complete(reset_feed_poll_t *poll, uint64_t now_ms,
 
 /* Retain this pointer-free, UTC-based value in RTC_DATA_ATTR storage. Import
  * only after an actual deep-sleep reset; cold boot must ignore RTC contents.
- * Version/size/checksum reject corrupt or incompatible snapshots. No secrets,
+ * Version 3 adds bounded announcement/forecast text; version/size/checksum reject old,
+ * corrupt or incompatible snapshots. No secrets,
  * ETag, heap pointer, RTOS handle, or boot-relative clock is retained. */
 typedef struct {
     uint32_t magic;

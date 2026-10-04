@@ -31,6 +31,9 @@ typedef struct {
     uint16_t provisioning_seconds_left;
     uint16_t disconnect_reason;
     esp_err_t last_error;
+    esp_err_t persistence_error; /* Independent, latched save/load/clear error.
+                                 * ESP_OK only after a verified save/clear (or boot).
+                                 * A live connection alone never clears it. */
     char ip[16];
     char message[64];           /* Nonsecret UI hint; never contains SSID/password. */
 } reset_wifi_status_t;
@@ -45,7 +48,10 @@ typedef struct {
 esp_err_t reset_wifi_init(bool enabled);
 
 /* OFF preserves credentials and stops BLE, scans, retries, and the Wi-Fi driver.
- * ON starts/reconnects only when not suspended. Requests are idempotent. */
+ * ON starts/reconnects only when not suspended. An explicit OFF/ON also permits
+ * one initialization retry after a fully cleaned failure; never a background
+ * retry loop. Incomplete cleanup requires a device restart. Requests are
+ * idempotent. */
 esp_err_t reset_wifi_set_enabled(bool enabled);
 
 /* Application must pause/drain its network workers before suspending. Await
@@ -68,9 +74,10 @@ esp_err_t reset_wifi_connect_saved(void);
 esp_err_t reset_wifi_start_provisioning(void);
 esp_err_t reset_wifi_stop_provisioning(void);
 
-/* The caller MUST obtain explicit on-device UI confirmation first. Clears only
- * saved station credentials, stops provisioning and disconnects Wi-Fi; never
- * erases the whole NVS partition. There is deliberately no remote erase command. */
+/* The caller MUST obtain explicit on-device UI confirmation first. Forgets the
+ * application's saved station using a verified tombstone, stops provisioning,
+ * and disconnects Wi-Fi. This is not secure erasure: legacy SDK credentials and
+ * old flash pages are untouched. Never erases NVS. No remote erase command. */
 esp_err_t reset_wifi_clear_credentials(void);
 
 /* Thread-safe snapshot, safe before init. Does not return credentials or SSID. */

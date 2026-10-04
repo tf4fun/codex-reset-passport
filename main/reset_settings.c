@@ -1,18 +1,24 @@
 #include "reset_settings.h"
 #include <stdio.h>
 #include <string.h>
+static bool sleep_minutes_valid(uint16_t minutes) {
+    return minutes == 0 || minutes == 5 || minutes == 10 || minutes == 30;
+}
 void reset_settings_defaults(reset_settings_t *s) {
+    if (!s) return;
     memset(s, 0, sizeof(*s));
     s->wifi_enabled = true;
     s->interval_minutes = 15;
     s->brightness = 45;
+    s->sleep_minutes = RESET_DEFAULT_SLEEP_MINUTES;
 }
 bool reset_settings_valid(const reset_settings_t *s) {
     return s && (s->interval_minutes == 5 || s->interval_minutes == 15 ||
         s->interval_minutes == 30 || s->interval_minutes == 60) &&
         s->utc_offset_minutes >= -720 && s->utc_offset_minutes <= 840 &&
         s->utc_offset_minutes % 15 == 0 &&
-        (s->brightness == 20 || s->brightness == 45 || s->brightness == 75);
+        (s->brightness == 20 || s->brightness == 45 || s->brightness == 75) &&
+        sleep_minutes_valid(s->sleep_minutes);
 }
 void reset_settings_zone_label(int minutes, char *out, size_t size) {
     if (!out || !size) return;
@@ -27,6 +33,7 @@ void reset_settings_zone_label(int minutes, char *out, size_t size) {
 #include "nvs.h"
 #include "nvs_flash.h"
 esp_err_t reset_settings_load(reset_settings_t *s) {
+    if (!s) return ESP_ERR_INVALID_ARG;
     reset_settings_defaults(s);
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) return err; /* Never erase unrelated NVS on failure. */
@@ -41,6 +48,11 @@ esp_err_t reset_settings_load(reset_settings_t *s) {
     (void)nvs_get_u16(handle, "interval", &candidate.interval_minutes);
     (void)nvs_get_i16(handle, "offset", &candidate.utc_offset_minutes);
     (void)nvs_get_u8(handle, "brightness", &candidate.brightness);
+    /* Old firmware has no separate sleep key. An absent/invalid new key must
+     * not throw away otherwise valid settings, especially remembered Wi-Fi OFF. */
+    err = nvs_get_u16(handle, "sleep_minutes", &candidate.sleep_minutes);
+    if (err != ESP_OK || !sleep_minutes_valid(candidate.sleep_minutes))
+        candidate.sleep_minutes = RESET_DEFAULT_SLEEP_MINUTES;
     nvs_close(handle);
     if (enabled <= 1 && reset_settings_valid(&candidate)) *s = candidate;
     return ESP_OK;
@@ -54,6 +66,7 @@ esp_err_t reset_settings_save(const reset_settings_t *s) {
     if (err == ESP_OK) err = nvs_set_u16(handle, "interval", s->interval_minutes);
     if (err == ESP_OK) err = nvs_set_i16(handle, "offset", s->utc_offset_minutes);
     if (err == ESP_OK) err = nvs_set_u8(handle, "brightness", s->brightness);
+    if (err == ESP_OK) err = nvs_set_u16(handle, "sleep_minutes", s->sleep_minutes);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;

@@ -14,13 +14,16 @@ add_subdirectory("${APP_ROOT}/managed_components/lvgl__lvgl" lvgl)
 add_executable(reset_ui_preview
     preview.c
     "${APP_ROOT}/main/reset_ui.c"
+    "${APP_ROOT}/main/reset_text.c"
     "${APP_ROOT}/main/reset_presenter.c"
+    "${APP_ROOT}/main/reset_hold.c"
     "${APP_ROOT}/main/reset_settings.c"
     "${APP_ROOT}/main/reset_feed.c"
     "${APP_ROOT}/tests/vendor/cjson/cJSON.c"
     "${APP_ROOT}/components/bsp/src/bsp_display_rounding.c"
     "${APP_ROOT}/assets/fonts/reset_font_16.c"
-    "${APP_ROOT}/assets/fonts/reset_font_12.c")
+    "${APP_ROOT}/assets/fonts/reset_font_12.c"
+    "${APP_ROOT}/assets/fonts/reset_font_24.c")
 target_include_directories(reset_ui_preview PRIVATE "${APP_ROOT}/main"
     "${APP_ROOT}/tests/vendor/cjson" "${APP_ROOT}/components/bsp/src")
 # Read the actual board macros without importing ESP-IDF-specific declarations.

@@ -621,6 +621,91 @@ static void test_rtc_preserves_backoff(void)
     assert(snapshot.next_auto_in_seconds == 600);
 }
 
+static void test_rtc_preserves_bounded_text(void)
+{
+    reset_fixture();
+    cJSON *root = cJSON_Parse(body_json);
+    cJSON *body = cJSON_GetObjectItemCaseSensitive(root, "data");
+    cJSON *latest = cJSON_Parse(
+        "{\"id\":\"latest-123\",\"reset_type\":\"regular\","
+        "\"announced_at\":\"2026-10-02T21:18:48Z\",\"text\":\"old\","
+        "\"source\":{\"type\":\"x_post\",\"author\":\"thsottiaux\",\"url\":\"https://x.com/thsottiaux/status/123\"}}");
+    cJSON *scheduled = cJSON_Parse(
+        "{\"id\":\"scheduled-456\",\"status\":\"scheduled\",\"reset_type\":\"banked\","
+        "\"announced_at\":\"2026-10-03T21:00:00Z\",\"scheduled_for\":null,"
+        "\"text\":\"Next reset\\nMore soon \\u91cd\\u7f6e \\ud83d\\ude00\",\"source\":{\"type\":\"observed\"}}");
+    cJSON *watch = cJSON_Parse(
+        "{\"level\":\"strong\",\"reset_chance_percent\":87,\"forecast_window\":\"soon\","
+        "\"observed_at\":\"2026-10-03T01:00:00Z\",\"expires_at\":\"2026-10-05T01:00:00Z\","
+        "\"text\":\"AI forecast only.\",\"source\":{\"type\":\"observed\"}}");
+    assert(root && body && latest && scheduled && watch);
+    char long_text[RESET_FEED_TEXT_MAX_BYTES + 6];
+    memset(long_text, 'a', RESET_FEED_TEXT_MAX_BYTES - 4);
+    strcpy(long_text + RESET_FEED_TEXT_MAX_BYTES - 4, "\xf0\x9f\x98\x80Z");
+    cJSON_ReplaceItemInObjectCaseSensitive(latest, "text", cJSON_CreateString(long_text));
+    char long_window[RESET_FEED_FORECAST_MAX_BYTES + 4];
+    memset(long_window, 'a', RESET_FEED_FORECAST_MAX_BYTES - 1);
+    strcpy(long_window + RESET_FEED_FORECAST_MAX_BYTES - 1, "\xc3\xa9Z");
+    cJSON_ReplaceItemInObjectCaseSensitive(watch, "forecast_window", cJSON_CreateString(long_window));
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "latest_reset", latest);
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", scheduled);
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "active_watch", watch);
+    char *json = cJSON_PrintUnformatted(root);
+    assert(json);
+    wire_body = json;
+    wire_length = strlen(json);
+    announced_length = (int64_t)wire_length;
+    assert(reset_feed_start() == ESP_OK);
+    assert(admit_fetch(0, fake_wall_time));
+    response_t response = fetch();
+    assert(response.error == RESET_FEED_ERROR_NONE);
+    apply_response(&response, 0, fake_wall_time);
+    assert(reset_feed_pause_and_wait(0));
+    reset_feed_rtc_state_t state;
+    assert(reset_feed_export_rtc(&state));
+    assert(state.version == 3 && state.size == sizeof(state));
+    assert(strlen(state.data.latest.text) == RESET_FEED_TEXT_MAX_BYTES);
+    assert(state.data.latest.text_truncated && state.data.latest.text_has_non_ascii);
+    assert(state.data.scheduled.present && state.data.scheduled.observed);
+    assert(strcmp(state.data.scheduled.id, "scheduled-456") == 0);
+    assert(!state.data.scheduled.text_truncated && state.data.scheduled.text_has_non_ascii);
+    assert(strcmp(state.data.scheduled.text, "Next reset\nMore soon \xe9\x87\x8d\xe7\xbd\xae \xf0\x9f\x98\x80") == 0);
+    assert(state.data.watch.forecast_window_truncated && state.data.watch.forecast_window_has_non_ascii);
+    assert(strlen(state.data.watch.forecast_window) == RESET_FEED_FORECAST_MAX_BYTES - 1);
+    cJSON_free(json);
+    cJSON_Delete(root);
+
+    reset_fixture();
+    assert(reset_feed_import_rtc(&state));
+    reset_feed_snapshot_t snapshot;
+    reset_feed_get_snapshot(&snapshot);
+    assert(snapshot.has_data && snapshot.stale);
+    assert(memcmp(&snapshot.data, &state.data, sizeof(state.data)) == 0);
+    assert(reset_feed_pause_and_wait(0));
+    reset_feed_rtc_state_t second;
+    assert(reset_feed_export_rtc(&second));
+    assert(memcmp(&second.data, &state.data, sizeof(state.data)) == 0);
+
+    reset_fixture();
+    reset_feed_rtc_state_t bad = state;
+    bad.version = 2; /* Previous cache layout cannot masquerade as current. */
+    bad.checksum = rtc_checksum(&bad);
+    assert(!reset_feed_import_rtc(&bad));
+    bad = state;
+    memset(bad.data.latest.text, 'a', sizeof(bad.data.latest.text));
+    bad.checksum = rtc_checksum(&bad);
+    assert(!reset_feed_import_rtc(&bad));
+    bad = state;
+    bad.data.scheduled.text[0] = '\x80';
+    bad.checksum = rtc_checksum(&bad);
+    assert(!reset_feed_import_rtc(&bad));
+    bad = state;
+    bad.data.watch.forecast_window[0] = '\x01';
+    bad.checksum = rtc_checksum(&bad);
+    assert(!reset_feed_import_rtc(&bad));
+    assert(!s_snapshot.has_data && !s_restore_pending);
+}
+
 int main(void)
 {
     test_fetch_and_cache();
@@ -630,6 +715,7 @@ int main(void)
     test_interval_and_pause();
     test_rtc_wake_and_corruption();
     test_rtc_preserves_backoff();
+    test_rtc_preserves_bounded_text();
     puts("Reset feed HTTPS fault-injection tests: PASS");
     return 0;
 }

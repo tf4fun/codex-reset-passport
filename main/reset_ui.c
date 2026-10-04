@@ -1,10 +1,15 @@
 #include "reset_ui.h"
+#include "reset_text.h"
 #include "lvgl.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
 LV_FONT_DECLARE(reset_font_16);
 LV_FONT_DECLARE(reset_font_12);
+LV_FONT_DECLARE(reset_font_24);
+static reset_text_layout_t announcement;
+static char next_text[272], next_heading[64], reading_meta[96], reading_number[16];
+static char reading_notice[72];
 #define PAPER 0xFFF4DD
 #define WHITE 0xFFFDF7
 #define INK 0x26201A
@@ -34,6 +39,7 @@ TEXT_STYLE(text_small_secondary, &reset_font_12, SECONDARY);
 TEXT_STYLE(text_small_muted, &reset_font_12, MUTED);
 TEXT_STYLE(text_small_alert, &reset_font_12, ALERT);
 TEXT_STYLE(text_regular, &reset_font_16, INK);
+TEXT_STYLE(text_hero, &reset_font_24, INK);
 TEXT_STYLE(text_ascii_12, &lv_font_montserrat_12, MUTED);
 TEXT_STYLE(text_ascii_14, &lv_font_montserrat_14, INK);
 TEXT_STYLE(text_ascii_20, &lv_font_montserrat_20, INK);
@@ -44,12 +50,19 @@ static void apply_text_style(lv_obj_t *obj, const lv_font_t *font, uint32_t colo
     const lv_style_t *style = &text_regular;
     if (font == &reset_font_12) style = color == SECONDARY ? &text_small_secondary :
         color == MUTED ? &text_small_muted : color == ALERT ? &text_small_alert : &text_small_ink;
+    else if (font == &reset_font_24) style = &text_hero;
     else if (font == &lv_font_montserrat_12) style = &text_ascii_12;
     else if (font == &lv_font_montserrat_14) style = &text_ascii_14;
     else if (font == &lv_font_montserrat_20) style = &text_ascii_20;
     else if (font == &lv_font_montserrat_32) style = &text_ascii_32;
     lv_obj_add_style(obj, style, 0);
 }
+
+static int font_advance(void *context, uint32_t cp, uint32_t next_cp) {
+    lv_font_glyph_dsc_t glyph = {0};
+    return lv_font_get_glyph_dsc((const lv_font_t *)context, &glyph, cp, next_cp) && !glyph.is_placeholder ? glyph.adv_w : -1;
+}
+uint8_t reset_ui_reading_page_count(void) { return announcement.page_count ? announcement.page_count : 1; }
 
 static lv_obj_t *label(int x, int y, int w, const char *value, const lv_font_t *font, uint32_t color) {
     lv_obj_t *obj = lv_label_create(content);
@@ -229,50 +242,63 @@ void reset_ui_update(const reset_ui_model_t *m) {
         snprintf(number, sizeof(number), "%u/4", (unsigned)m->page + 1);
         label(192, 52, 30, number, &lv_font_montserrat_12, MUTED);
     }
+    reset_text_layout(m->announcement_text, sizeof(m->announcement_text), m->announcement_truncated,
+                      font_advance, (void *)&reset_font_16, RESET_TEXT_WIDTH, &announcement);
     if (m->page == RESET_UI_HOME) {
-        small(22, 47, 196, "全站公告观察", SECONDARY);
-        rect(18, 73, 202, 142, WHITE, 12, true);
-        small(30, 84, 178, m->status, m->warning ? ALERT : SECONDARY);
-        rect(29, 105, 181, 45, SUN, 8, false);
-        label(38, 110, 166, m->hero, &lv_font_montserrat_32, INK);
-        label(30, 162, 178, m->date, &lv_font_montserrat_20, INK);
-        small(30, 189, 178, m->zone, MUTED);
-        if (m->has_notice) {
-            rect(18, 228, 202, 52, SKY, 10, true);
-            small(29, 236, 181, m->next_title, SECONDARY);
-            text(29, 254, 181, m->next_body, INK);
-        } else {
-            rect(18, 228, 96, 52, ROSE, 10, true);
-            rect(124, 228, 96, 52, SKY, 10, true);
-            small(28, 235, 76, "重置次数", SECONDARY);
-            small(134, 235, 76, "平均间隔(天)", SECONDARY);
-            label(28, 253, 78, m->stats_total, &lv_font_montserrat_20, INK);
-            label(134, 253, 78, m->stats_average, &lv_font_montserrat_20, INK);
-        }
+        title("最新重置公告");
+        rect(18, 78, 202, 138, WHITE, 12, true);
+        small(30, 87, 178, m->announcement_type, SECONDARY);
+        rect(29, 113, 180, 49, SUN, 8, false);
+        label(37, 125, 168, !strcmp(m->announcement_age, "时间暂未公布") ? "--" : m->announcement_age,
+              &reset_font_24, INK);
+        label(30, 174, 178, m->announcement_date, &lv_font_montserrat_14, INK);
+        small(30, 196, 178, m->zone, MUTED);
+        rect(18, 226, 202, 57, SKY, 10, true);
+        bool shortened = reset_text_fit(m->next_body, sizeof(m->next_body), 2, font_advance,
+                                         (void *)&reset_font_12, 178, next_text, sizeof(next_text));
+        snprintf(next_heading, sizeof(next_heading), "%.47s", m->timing_is_forecast && (shortened || m->next_truncated) ?
+                 "预测摘录 · 有省略或字形替换" : m->next_title);
+        small(30, 231, 178, next_heading, SECONDARY);
+        small(30, 249, 178, next_text, INK);
         footer(m->freshness, m->warning);
+    } else if (m->page == RESET_UI_OVERVIEW) {
+        title("重置概览");
+        rect(18, 86, 202, 176, WHITE, 12, true);
+        small(30, 97, 178, m->status, SECONDARY);
+        rect(29, 124, 180, 54, SUN, 8, false);
+        label(37, 135, 168, m->hero, &reset_font_24, INK);
+        label(30, 190, 178, m->date, &lv_font_montserrat_14, INK);
+        small(30, 214, 178, m->zone, MUTED);
+        small(30, 240, 178, "时间依站点记录", SECONDARY);
+        small(23, 274, 194, m->detail_type, SECONDARY);
+        footer("第三方汇总 · 非个人额度", false);
+    } else if (m->page == RESET_UI_READING) {
+        title("公告原文");
+        unsigned page = m->reading_page < announcement.page_count ? m->reading_page : announcement.page_count - 1U;
+        snprintf(reading_number, sizeof(reading_number), "%u/%u", page + 1U, announcement.page_count);
+        label(186, 54, 36, reading_number, &lv_font_montserrat_12, MUTED);
+        snprintf(reading_meta, sizeof(reading_meta), "%.47s  %.31s", m->announcement_date, m->zone);
+        small(24, 83, 192, reading_meta, MUTED);
+        text(30, 107, 178, announcement.pages[page], INK);
+        snprintf(reading_notice, sizeof(reading_notice), "%s", announcement.glyph_substituted &&
+                 (announcement.source_truncated || announcement.page_limit_reached) ? "原文有截断 · 部分字形已替换" :
+                 announcement.page_limit_reached ? "已达八页上限 · 请查看站点" :
+                 announcement.source_truncated ? "仅保留前256字节 · 请查看站点" :
+                 announcement.glyph_substituted ? "部分字形已替换为 ?" : "");
+        if (reading_notice[0]) small(24, 275, 192, reading_notice, ALERT);
+        small(24, 295, 192, "codex-resets.com", MUTED);
     } else if (m->page == RESET_UI_STATS) {
         title("站点统计");
         full_stat(86, SUN, "累计已执行重置", m->stats_total);
         full_stat(151, ROSE, "平均间隔 · 天", m->stats_average);
         full_stat(216, SKY, "距上次 · 天", m->stats_elapsed);
         footer("上下翻页 · 长按确认休眠", false);
-    } else if (m->page == RESET_UI_DETAILS) {
-        title("最新公告");
-        rect(18, 84, 202, 189, WHITE, 12, true);
-        text(30, 98, 178, m->detail_type, INK);
-        label(30, 128, 178, m->date, &lv_font_montserrat_20, INK);
-        small(30, 155, 178, m->zone, MUTED);
-        small(30, 181, 178, m->detail_source, SECONDARY);
-        small(30, 207, 178, "站点数据生成时间 UTC", MUTED);
-        label(30, 228, 178, m->detail_generated, &lv_font_montserrat_14, INK);
-        small(30, 251, 178, "codex-resets.com", SECONDARY);
-        footer("第三方汇总 · 非个人额度", false);
     } else if (m->page == RESET_UI_SETTINGS) {
         title("设备设置");
-        static const char *names[] = {"Wi-Fi", "自动同步", "本地时差", "屏幕亮度", "蓝牙配网", "返回概览"};
-        for (int i = 0; i < 6; ++i) {
-            int y = 85 + 32 * i;
-            if (m->settings_editing && m->selected_setting == i) rect(18, y - 4, 202, 30, SUN, 7, false);
+        static const char *names[] = {"Wi-Fi", "自动同步", "固定时差", "屏幕亮度", "自动休眠", "蓝牙配网", "返回公告"};
+        for (int i = 0; i < 7; ++i) {
+            int y = 84 + 28 * i;
+            if (m->settings_editing && m->selected_setting == i) rect(18, y - 4, 202, 26, SUN, 7, false);
             small(28, y + 2, 79, names[i], SECONDARY);
             small(112, y + 2, 98, m->settings_values[i], INK);
         }
@@ -294,6 +320,7 @@ void reset_ui_update(const reset_ui_model_t *m) {
         label(29, 177, 182, "AI PASSPORT", &lv_font_montserrat_14, INK);
         small(29, 205, 182, "BLUFI_FoloPassport", MUTED);
         small(29, 229, 182, m->setup_timer, MUTED);
+        if (m->setup_diagnostic[0]) small(24, 266, 192, m->setup_diagnostic, ALERT);
         footer("上开启 · 下清除 · 确认返回", false);
     } else if (m->page == RESET_UI_CLEAR) {
         title("清除保存的网络？");

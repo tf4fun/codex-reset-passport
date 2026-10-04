@@ -24,6 +24,7 @@
 #include "mbedtls/platform_util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
@@ -37,6 +38,9 @@
 #define CONTROL_SUSPENDED 2U
 #define CONTROL_FLAGS 3U
 #define CONTROL_SEQUENCE 4U
+#define CREDENTIAL_NAMESPACE "reset_wifi"
+#define CREDENTIAL_KEY "station"
+#define CREDENTIAL_RECORD_SIZE 108U
 
 static const char *TAG = "reset_wifi";
 
@@ -60,6 +64,12 @@ static reset_wifi_status_t s_status = { .state = RESET_WIFI_STARTING };
 /* A durable control mailbox cannot be starved by a full callback event queue.
  * Low bits are desired flags; upper bits invalidate work from an older request. */
 static atomic_uint s_control;
+/* Increment only for explicit OFF -> ON, independently of sleep/resume. */
+static atomic_uint s_enable_requests;
+static unsigned s_init_retry_seen;
+static bool s_init_retry_safe = true;
+static bool s_netif_ready;
+static bool s_wifi_driver_initialized;
 static uint32_t s_applied_control;
 static uint32_t s_public_control;
 /* All following connection fields are worker-owned. */
@@ -71,6 +81,7 @@ static wifi_config_t s_active;
 static bool s_want_connect;
 static bool s_in_flight;
 static bool s_candidate;
+static bool s_candidate_save_attempted;
 static bool s_wifi_started;
 static int64_t s_connect_due;
 static int64_t s_reconnect_cooldown;
@@ -180,6 +191,7 @@ static esp_err_t request_control(uint32_t mask, bool value)
         if (next == old) return ESP_OK;
         next += CONTROL_SEQUENCE;
     } while (!atomic_compare_exchange_weak(&s_control, &old, next));
+    if (mask == CONTROL_ENABLED && value) atomic_fetch_add(&s_enable_requests, 1);
     /* Close the credential ingress synchronously, before worker teardown. */
     if ((next & CONTROL_FLAGS) != CONTROL_ENABLED) atomic_store(&s_setup_open, false);
     return ESP_OK;
@@ -318,6 +330,16 @@ static bool valid_password(const uint8_t *password, int length)
 static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
     switch (event) {
+    case ESP_BLUFI_EVENT_REPORT_ERROR:
+        /* Restore the public BLUFI diagnostic path used by the official demo.
+         * Log only the numeric protocol error, never credential payloads. */
+        if (param) {
+            ESP_LOGW(TAG, "BLUFI protocol error: %d", (int)param->report_error.state);
+            if (radio_requested() && atomic_load(&s_setup_open) &&
+                atomic_load(&s_ble_connected))
+                esp_blufi_send_error_info(param->report_error.state);
+        }
+        return;
     case ESP_BLUFI_EVENT_INIT_FINISH:
         if (param->init_finish.state == ESP_BLUFI_INIT_OK) {
             atomic_store(&s_profile_initialized, true);
@@ -526,34 +548,153 @@ static esp_err_t host_stop(void)
     return ESP_OK;
 }
 
+/* Version 1: fixed 108-byte little-endian record, independent of wifi_config_t
+ * padding/SDK ABI: version[4], length[4], SSID[32], password[64], CRC32[4].
+ * An all-zero SSID/password is an explicit tombstone; never erase the key and
+ * fall back to a superseded legacy driver record. CRC detects corruption, not
+ * tampering. The NVS security boundary is unchanged from SDK credentials. */
+static uint32_t record_u32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
+           (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+}
+
+static void record_put_u32(uint8_t *bytes, uint32_t value)
+{
+    for (unsigned i = 0; i < 4; ++i) bytes[i] = (uint8_t)(value >> (8 * i));
+}
+
+static uint32_t record_crc(const uint8_t *bytes, size_t size)
+{
+    uint32_t crc = UINT32_MAX;
+    for (size_t i = 0; i < size; ++i) {
+        crc ^= bytes[i];
+        for (unsigned bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (UINT32_C(0xedb88320) & (0U - (crc & 1U)));
+    }
+    return ~crc;
+}
+
+static void encode_credentials(const wifi_config_t *config, uint8_t *record)
+{
+    memset(record, 0, CREDENTIAL_RECORD_SIZE);
+    record_put_u32(record, 1);
+    record_put_u32(record + 4, CREDENTIAL_RECORD_SIZE);
+    memcpy(record + 8, config->sta.ssid, 32);
+    memcpy(record + 40, config->sta.password, 64);
+    record_put_u32(record + 104, record_crc(record, 104));
+}
+
+static esp_err_t load_credentials(wifi_config_t *config)
+{
+    uint8_t record[CREDENTIAL_RECORD_SIZE] = { 0 };
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(CREDENTIAL_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    size_t size = 0;
+    err = nvs_get_blob(handle, CREDENTIAL_KEY, NULL, &size);
+    if (err == ESP_OK && size != sizeof(record)) err = ESP_ERR_INVALID_SIZE;
+    if (err == ESP_OK) err = nvs_get_blob(handle, CREDENTIAL_KEY, record, &size);
+    nvs_close(handle);
+    if (err == ESP_OK && (size != sizeof(record) || record_u32(record) != 1 ||
+        record_u32(record + 4) != sizeof(record) ||
+        record_u32(record + 104) != record_crc(record, 104))) err = ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK && record[8] == 0) {
+        /* A malformed empty record must not be interpreted as a valid clear. */
+        for (unsigned i = 8; i < 104; ++i)
+            if (record[i] != 0) { err = ESP_ERR_INVALID_STATE; break; }
+    }
+    if (err == ESP_OK) {
+        memset(config, 0, sizeof(*config));
+        memcpy(config->sta.ssid, record + 8, 32);
+        memcpy(config->sta.password, record + 40, 64);
+    }
+    mbedtls_platform_zeroize(record, sizeof(record));
+    return err;
+}
+
+static bool cleanup_failed_init(void)
+{
+    bool clean = true;
+    if (s_ip_handler) {
+        if (esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID,
+                                                  s_ip_handler) == ESP_OK)
+            s_ip_handler = NULL;
+        else clean = false;
+    }
+    if (s_wifi_handler) {
+        if (esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                  s_wifi_handler) == ESP_OK)
+            s_wifi_handler = NULL;
+        else clean = false;
+    }
+    if (s_wifi_driver_initialized) {
+        if (esp_wifi_deinit() == ESP_OK) s_wifi_driver_initialized = false;
+        else clean = false;
+    }
+    if (clean && s_netif) {
+        esp_netif_destroy_default_wifi(s_netif);
+        s_netif = NULL;
+    }
+    s_status.radio_stopped = clean;
+    return clean;
+}
+
 static esp_err_t wifi_initialize(void)
 {
+    s_init_retry_safe = true;
+    s_status.radio_stopped = true;
     esp_err_t err = nvs_flash_init();
     /* Never erase NVS to "repair" startup. Other application data may be there. */
     if (err != ESP_OK) return err;
-    err = esp_netif_init();
-    if (err != ESP_OK) return err;
+    if (!s_netif_ready) {
+        err = esp_netif_init();
+        if (err != ESP_OK) return err;
+        s_netif_ready = true;
+    }
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
     s_netif = esp_netif_create_default_wifi_sta();
     if (!s_netif) return ESP_ERR_NO_MEM;
+    s_init_retry_safe = false;
     /* The vendor driver has diagnostic format strings for network identifiers
      * and passwords. Keep its verbose logs disabled before initialization. */
     esp_log_level_set("wifi", ESP_LOG_WARN);
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&config);
-    if (err != ESP_OK) goto fail_netif;
+    if (err != ESP_OK) {
+        /* IDF can fail its own unwind inside esp_wifi_init, without returning
+         * that cleanup error. Only a successful deinit proves safe ownership
+         * release; NOT_INIT cannot establish that after a partial init error. */
+        s_wifi_driver_initialized = true;
+        goto failed;
+    }
+    s_wifi_driver_initialized = true;
     err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                               wifi_event, NULL, &s_wifi_handler);
-    if (err != ESP_OK) goto fail_wifi;
+    if (err != ESP_OK) goto failed;
     err = esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID,
                                               wifi_event, NULL, &s_ip_handler);
-    if (err != ESP_OK) goto fail_wifi_handler;
+    if (err != ESP_OK) goto failed;
     err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err == ESP_OK) err = esp_wifi_get_config(WIFI_IF_STA, &s_saved);
-    /* Do not persist partial or untested configurations. */
-    if (err == ESP_OK) err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    /* Read old firmware credentials only when there is no application record.
+     * Corrupt/unreadable records must not resurrect a superseded legacy SSID. */
+    if (err == ESP_OK) {
+        wifi_config_t stored = { 0 };
+        esp_err_t load_error = load_credentials(&stored);
+        if (load_error == ESP_ERR_NVS_NOT_FOUND)
+            load_error = esp_wifi_get_config(WIFI_IF_STA, &stored);
+        if (load_error == ESP_OK) {
+            s_saved = stored;
+        } else {
+            mbedtls_platform_zeroize(&s_saved, sizeof(s_saved));
+            s_status.persistence_error = load_error;
+            fail(load_error, "Saved Wi-Fi unreadable; retry setup");
+        }
+        mbedtls_platform_zeroize(&stored, sizeof(stored));
+        err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    }
     if (err == ESP_OK) {
         s_status.has_credentials = s_saved.sta.ssid[0] != 0;
         s_status.initialized = true;
@@ -562,15 +703,8 @@ static esp_err_t wifi_initialize(void)
         hint("Wi-Fi ready; radio stopped");
         return ESP_OK;
     }
-    esp_wifi_stop();
-    esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, s_ip_handler);
-fail_wifi_handler:
-    esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_handler);
-fail_wifi:
-    esp_wifi_deinit();
-fail_netif:
-    esp_netif_destroy_default_wifi(s_netif);
-    s_netif = NULL;
+failed:
+    s_init_retry_safe = cleanup_failed_init();
     return err;
 }
 
@@ -596,6 +730,7 @@ static void begin_connection(const wifi_config_t *config, bool candidate)
     if (!radio_allowed()) return;
     connection_stop();
     s_candidate = candidate;
+    s_candidate_save_attempted = false;
     s_active = *config;
     s_active.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     s_active.sta.pmf_cfg.capable = true;
@@ -641,12 +776,38 @@ static void retry_later(esp_err_t error)
     hint("Wi-Fi retry scheduled");
 }
 
-static esp_err_t persist_config(const wifi_config_t *config)
+static esp_err_t persist_config(const wifi_config_t *config, bool candidate, bool *cancelled)
 {
-    esp_err_t err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
-    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, (wifi_config_t *)config);
-    esp_err_t ram_err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    return err == ESP_OK ? ram_err : err;
+    if (cancelled) *cancelled = false;
+    uint8_t record[CREDENTIAL_RECORD_SIZE];
+    encode_credentials(config, record);
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(CREDENTIAL_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        /* Recheck after opening storage; an OFF/sleep intent cancels queued
+         * candidates. A write already in progress cannot be rolled back. */
+        if (candidate && !radio_allowed()) {
+            if (cancelled) *cancelled = true;
+            err = ESP_ERR_INVALID_STATE;
+        }
+        else err = nvs_set_blob(handle, CREDENTIAL_KEY, record, sizeof(record));
+        if (err == ESP_OK) err = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    if (err == ESP_OK) {
+        wifi_config_t verified = { 0 };
+        err = load_credentials(&verified); /* Close/reopen and validate bytes. */
+        if (err == ESP_OK &&
+            (memcmp(verified.sta.ssid, config->sta.ssid, 32) != 0 ||
+             memcmp(verified.sta.password, config->sta.password, 64) != 0))
+            err = ESP_ERR_INVALID_STATE;
+        mbedtls_platform_zeroize(&verified, sizeof(verified));
+    }
+    /* Public NVS APIs cannot promise rollback after an ambiguous write/commit
+     * error. Preserve the previous confirmed s_saved and report uncertainty;
+     * never try to "repair" the error by erasing or rewriting old credentials. */
+    mbedtls_platform_zeroize(record, sizeof(record));
+    return err;
 }
 
 static void end_setup(bool restore_saved)
@@ -692,11 +853,21 @@ static esp_err_t radio_stop(void)
 static void apply_controls(void)
 {
     uint32_t requested = atomic_load(&s_control);
-    if (requested == s_applied_control) return;
+    unsigned enable_requests = atomic_load(&s_enable_requests);
+    bool retry_init = !s_status.initialized && s_init_retry_safe &&
+                      (requested & CONTROL_FLAGS) == CONTROL_ENABLED &&
+                      enable_requests != s_init_retry_seen;
+    if (requested == s_applied_control && !retry_init) return;
     s_applied_control = requested;
     if (!s_status.initialized) {
-        /* Preserve the initialization failure for the application. */
-        return;
+        if (!retry_init || requested != atomic_load(&s_control)) return;
+        s_init_retry_seen = enable_requests; /* One attempt per explicit ON. */
+        esp_err_t init_error = wifi_initialize();
+        if (init_error != ESP_OK) {
+            fail(init_error, s_init_retry_safe ? "Wi-Fi initialization failed" :
+                 "Wi-Fi init cleanup failed; restart");
+            return;
+        }
     }
     esp_err_t err = radio_stop();
     if (err != ESP_OK) {
@@ -764,15 +935,17 @@ static void handle_command(const command_t *command)
         connection_stop();
         s_candidate = false;
         wifi_config_t empty = { 0 };
-        esp_err_t err = persist_config(&empty);
+        esp_err_t err = persist_config(&empty, false, NULL);
         if (err != ESP_OK) {
-            fail(err, "Could not clear saved Wi-Fi");
+            s_status.persistence_error = err;
+            fail(err, "Could not confirm saved Wi-Fi clear");
             break;
         }
         mbedtls_platform_zeroize(&s_saved, sizeof(s_saved));
         mbedtls_platform_zeroize(&s_active, sizeof(s_active));
         clear_staging();
         s_status.has_credentials = false;
+        s_status.persistence_error = ESP_OK;
         s_status.attempts = 0;
         s_status.last_error = ESP_OK;
         s_status.state = RESET_WIFI_IDLE;
@@ -824,22 +997,38 @@ static void handle_command(const command_t *command)
             snprintf(s_status.ip, sizeof(s_status.ip), IPSTR, IP2STR(&ip));
         }
         hint("Wi-Fi connected");
-        if (s_candidate) {
+        if (s_candidate && !s_candidate_save_attempted) {
             /* Recheck immediately before the only candidate persistence path.
              * OFF/suspend closes acceptance even before its worker turn. */
             if (!radio_allowed()) break;
-            esp_err_t err = persist_config(&s_active);
+            s_candidate_save_attempted = true;
+            bool cancelled = false;
+            esp_err_t err = persist_config(&s_active, true, &cancelled);
+            if (cancelled) break;
+            /* OFF cannot cancel a synchronous flash write already in flight.
+             * Keep its actual verified result, including uncertainty, visible
+             * even when control changed while the NVS call was running. */
+            s_status.persistence_error = err;
             if (err == ESP_OK) {
                 s_saved = s_active;
                 s_status.has_credentials = true;
+                if (!radio_allowed()) break;
+                s_candidate = false;
+                s_success_stop_due = now_ms() + SUCCESS_REPORT_GRACE_MS;
             } else {
-                fail(err, "Connected, but saving Wi-Fi failed");
+                fail(err, "Connected; Wi-Fi save unconfirmed");
+                s_status.attempts = 0;
+                /* Keep the original setup deadline and candidate flag so local
+                 * cancellation restores the prior confirmed network. No blind
+                 * write retry on duplicate IP/reconnect callbacks. BLUFI has no
+                 * storage-error code: do not invent one or report a false link
+                 * failure. Suppress automatic success; explicit status queries
+                 * still report the actual live station state. */
+                break;
             }
-            s_candidate = false;
-            s_success_stop_due = now_ms() + SUCCESS_REPORT_GRACE_MS;
         }
         s_status.attempts = 0;
-        send_report();
+        if (!s_candidate || !s_status.persistence_error) send_report();
         break;
     case EVT_DISCONNECTED:
         s_status.disconnect_reason = command->value;
@@ -918,8 +1107,10 @@ static void tick(void)
 static void worker(void *arg)
 {
     (void)arg;
+    s_init_retry_seen = atomic_load(&s_enable_requests);
     esp_err_t err = wifi_initialize();
-    if (err != ESP_OK) fail(err, "Wi-Fi initialization failed");
+    if (err != ESP_OK) fail(err, s_init_retry_safe ? "Wi-Fi initialization failed" :
+                            "Wi-Fi init cleanup failed; restart");
     apply_controls();
     publish();
     for (;;) {
