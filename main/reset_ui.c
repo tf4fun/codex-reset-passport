@@ -1,6 +1,9 @@
 #include "reset_ui.h"
+#include "reset_ui_layout.h"
 #include "reset_text.h"
 #include "lvgl.h"
+#include "src/libs/qrcode/qrcodegen.h"
+#include "src/misc/lv_text_private.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -8,7 +11,8 @@ LV_FONT_DECLARE(reset_font_16);
 LV_FONT_DECLARE(reset_font_12);
 LV_FONT_DECLARE(reset_font_24);
 static reset_text_layout_t announcement;
-static char next_text[272], next_heading[64], reading_meta[96], reading_number[16];
+static char next_text[272], reading_meta[96], reading_number[16];
+static char latest_heading[80], future_heading[80], forecast_input[160];
 static char reading_notice[72];
 #define PAPER 0xFFF4DD
 #define WHITE 0xFFFDF7
@@ -18,6 +22,8 @@ static char reading_notice[72];
 #define SUN 0xFFD84D
 #define ROSE 0xFFB9CC
 #define SKY 0xA5DCFF
+#define FUTURE_TIME 0xD6EEFF
+#define FUTURE_TIME_EDGE 0x397A9F
 #define ALERT 0x96512C
 static lv_obj_t *screen, *content;
 static reset_ui_model_t previous;
@@ -62,7 +68,7 @@ static int font_advance(void *context, uint32_t cp, uint32_t next_cp) {
     lv_font_glyph_dsc_t glyph = {0};
     return lv_font_get_glyph_dsc((const lv_font_t *)context, &glyph, cp, next_cp) && !glyph.is_placeholder ? glyph.adv_w : -1;
 }
-uint8_t reset_ui_reading_page_count(void) { return announcement.page_count ? announcement.page_count : 1; }
+uint8_t reset_ui_reading_page_count(void) { return (announcement.page_count ? announcement.page_count : 1) + 1U; }
 
 static lv_obj_t *label(int x, int y, int w, const char *value, const lv_font_t *font, uint32_t color) {
     lv_obj_t *obj = lv_label_create(content);
@@ -74,11 +80,108 @@ static lv_obj_t *label(int x, int y, int w, const char *value, const lv_font_t *
     apply_text_style(obj, font, color);
     return obj;
 }
+/* Centre the visible glyph union, not the font's line box. All callers pass
+ * bounded, NUL-terminated presenter strings. This matches LVGL 9.5's glyph
+ * baseline/box positioning, including mixed numerals and CJK. */
+static void time_label(int x, int panel_y, int w, int panel_h, const char *value, const lv_font_t *font) {
+    int top = INT32_MAX, bottom = INT32_MIN;
+    uint32_t offset = 0;
+    while (value[offset]) {
+        uint32_t cp = lv_text_encoded_next(value, &offset);
+        if (!cp) break;
+        lv_font_glyph_dsc_t glyph = {0};
+        if (!lv_font_get_glyph_dsc(font, &glyph, cp, 0) || !glyph.box_w || !glyph.box_h) continue;
+        int glyph_top = (int)font->line_height - font->base_line - glyph.box_h - glyph.ofs_y;
+        int glyph_bottom = glyph_top + glyph.box_h;
+        if (glyph_top < top) top = glyph_top;
+        if (glyph_bottom > bottom) bottom = glyph_bottom;
+    }
+    int y = panel_y + (panel_h - font->line_height) / 2;
+    /* Put an odd spare pixel above the glyph box. Actual-pixel probes (not
+     * just descriptor heights) verify the resulting optical margins. */
+    if (bottom > top) y = panel_y + 1 + (panel_h - 2 - (bottom - top) + 1) / 2 - top;
+    label(x, y, w, value, font, INK);
+}
 static void text(int x, int y, int w, const char *value, uint32_t color) {
     label(x, y, w, value, &reset_font_16, color);
 }
 static void small(int x, int y, int w, const char *value, uint32_t color) {
     label(x, y, w, value, &reset_font_12, color);
+}
+static void title(const char *value);
+
+/* The bundled LVGL encoder uses byte mode at medium ECC. Compute its exact
+ * minimum version ourselves: LVGL's optional quiet-zone helper can provide
+ * less than four modules, so reserve our own ISO-sized border instead. */
+static void source_page(const reset_ui_model_t *m) {
+    const char *url = m->announcement_source_url;
+    bool original = m->announcement_source_original;
+    size_t length = strnlen(url, sizeof(m->announcement_source_url));
+    int version = length < sizeof(m->announcement_source_url) ?
+                  qrcodegen_getMinFitVersion(qrcodegen_Ecc_MEDIUM, length) : 0;
+    int modules = version > 0 ? qrcodegen_version2size(version) : 0;
+    int scale = modules ? 192 / (modules + 8) : 0;
+    /* Never truncate an encoded address or shrink below three screen pixels
+     * per module. Bad/oversized input uses the explicitly labelled data site. */
+    if (!reset_feed_source_url_valid(url, sizeof(m->announcement_source_url)) || scale < 3) {
+        url = "https://codex-resets.com/zh-CN";
+        original = false;
+        length = strlen(url);
+        version = qrcodegen_getMinFitVersion(qrcodegen_Ecc_MEDIUM, length);
+        modules = qrcodegen_version2size(version);
+        scale = 192 / (modules + 8);
+    }
+    title(original ? "扫码查看原文" : "查看数据来源");
+    lv_mem_monitor_t memory;
+    lv_mem_monitor(&memory);
+    /* lv_qrcode_create first allocates an LV_DPI_DEF I1 canvas. set_size then
+     * allocates the requested I1 canvas BEFORE releasing that default buffer.
+     * Budget both exact stride/height/palette/alignment sizes, two draw-buffer
+     * descriptors, and the encoder's two version-bounded work buffers. The
+     * separate 1536-byte reserve conservatively covers the paper/QR widgets,
+     * styles, child arrays and allocator headers on the 64-bit host (and C3).
+     * Contiguous capacity is required per allocation, not for the whole sum:
+     * a fixed 6000-byte largest-block test rejected usable fragmented pools. */
+    size_t pixels = (size_t)(modules * scale);
+    size_t canvas_bytes = lv_draw_buf_width_to_stride((uint32_t)pixels, LV_COLOR_FORMAT_I1) * pixels +
+                          LV_COLOR_INDEXED_PALETTE_SIZE(LV_COLOR_FORMAT_I1) * sizeof(lv_color32_t) + LV_DRAW_BUF_ALIGN;
+    size_t default_bytes = lv_draw_buf_width_to_stride(LV_DPI_DEF, LV_COLOR_FORMAT_I1) * (size_t)LV_DPI_DEF +
+                           LV_COLOR_INDEXED_PALETTE_SIZE(LV_COLOR_FORMAT_I1) * sizeof(lv_color32_t) + LV_DRAW_BUF_ALIGN;
+    size_t scratch_bytes = 2U * qrcodegen_BUFFER_LEN_FOR_VERSION(version) + 128U;
+    const size_t widget_reserve = 1536U;
+    size_t largest_canvas = canvas_bytes > default_bytes ? canvas_bytes : default_bytes;
+    if (memory.free_size < canvas_bytes + default_bytes + 2U * sizeof(lv_draw_buf_t) + widget_reserve + scratch_bytes ||
+        memory.free_biggest_size < largest_canvas + sizeof(lv_draw_buf_t) + widget_reserve) {
+        text(30, 143, 180, "二维码暂不可用", INK);
+        small(30, 175, 180, "请返回后重试", SECONDARY);
+        return;
+    }
+    lv_obj_t *paper = lv_obj_create(content);
+    lv_obj_remove_style_all(paper);
+    lv_obj_set_pos(paper, 24, 82);
+    lv_obj_set_size(paper, 192, 192);
+    lv_obj_remove_flag(paper, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(paper, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_bg_opa(paper, LV_OPA_COVER, 0);
+    lv_obj_t *qr = lv_qrcode_create(paper);
+    lv_qrcode_set_size(qr, modules * scale);
+    lv_qrcode_set_dark_color(qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(qr, lv_color_hex(0xffffff));
+    lv_qrcode_set_quiet_zone(qr, false);
+    lv_obj_center(qr);
+    lv_draw_buf_t *buffer = lv_canvas_get_draw_buf(qr);
+    /* The upstream encoder allocates two version-bounded scratch buffers.
+     * Check their joint contiguous budget after the canvas allocation, while
+     * the LVGL lock excludes other callers, rather than relying on assertions. */
+    lv_mem_monitor(&memory);
+    if (memory.free_biggest_size < scratch_bytes ||
+        !buffer || buffer->header.w != (unsigned)(modules * scale) ||
+        buffer->header.h != (unsigned)(modules * scale) ||
+        lv_qrcode_update(qr, url, length) != LV_RESULT_OK) {
+        lv_obj_delete(paper);
+        text(30, 143, 180, "二维码暂不可用", INK);
+        small(30, 175, 180, "请返回后重试", SECONDARY);
+    }
 }
 static void draw_card_shadow(lv_event_t *event) {
     if (lv_event_get_code(event) == LV_EVENT_REFR_EXT_DRAW_SIZE) {
@@ -97,7 +200,7 @@ static void draw_card_shadow(lv_event_t *event) {
     draw.radius = lv_obj_get_style_radius(obj, LV_PART_MAIN);
     lv_draw_rect(lv_event_get_layer(event), &draw, &area);
 }
-static void rect(int x, int y, int w, int h, uint32_t color, int radius, bool shadow) {
+static lv_obj_t *rect(int x, int y, int w, int h, uint32_t color, int radius, bool shadow) {
     lv_obj_t *obj = lv_obj_create(content);
     lv_obj_remove_style_all(obj);
     lv_obj_set_pos(obj, x, y);
@@ -112,6 +215,7 @@ static void rect(int x, int y, int w, int h, uint32_t color, int radius, bool sh
         lv_obj_add_event_cb(obj, draw_card_shadow, LV_EVENT_REFR_EXT_DRAW_SIZE, NULL);
         lv_obj_refresh_ext_draw_size(obj);
     }
+    return obj;
 }
 static void title(const char *value) { text(22, 52, 196, value, INK); }
 static void footer(const char *value, bool warning) {
@@ -122,6 +226,87 @@ static void full_stat(int y, uint32_t color, const char *name, const char *numbe
     small(30, y + 8, 178, name, SECONDARY);
     label(30, y + 25, 178, number, &lv_font_montserrat_20, INK);
 }
+#define HISTORY_REGULAR_COLOR 0xFF5C29
+#define HISTORY_BANKED_COLOR 0xFFAD7C
+#define HISTORY_EMPTY_COLOR 0xDDD3C1
+#define HISTORY_FUTURE_COLOR 0xF5EEDC
+static void history_cell(lv_layer_t *layer, int x, int y, int w, int h, uint8_t state) {
+    lv_draw_rect_dsc_t draw;
+    lv_draw_rect_dsc_init(&draw);
+    draw.radius = 3;
+    draw.bg_opa = LV_OPA_COVER;
+    /* Solid dates do not need heavy outlines. Unknown remains outlined so
+     * verified empty, uncovered and future days retain distinct treatments. */
+    draw.border_color = lv_color_hex(MUTED);
+    draw.border_width = state == RESET_HISTORY_DAY_UNKNOWN ? 1 : 0;
+    draw.bg_color = lv_color_hex(state == RESET_HISTORY_DAY_REGULAR || state == RESET_HISTORY_DAY_BOTH ? HISTORY_REGULAR_COLOR :
+                                state == RESET_HISTORY_DAY_BANKED ? HISTORY_BANKED_COLOR :
+                                state == RESET_HISTORY_DAY_EMPTY ? HISTORY_EMPTY_COLOR :
+                                state == RESET_HISTORY_DAY_FUTURE ? HISTORY_FUTURE_COLOR : WHITE);
+    lv_area_t area = {x, y, x + w - 1, y + h - 1};
+    lv_draw_rect(layer, &draw, &area);
+    if (state == RESET_HISTORY_DAY_BOTH) {
+        /* Two colours in one UTC-day cell preserve both kinds without inventing a count. */
+        draw.radius = 1; draw.border_width = 0;
+        draw.bg_color = lv_color_hex(HISTORY_BANKED_COLOR);
+        area.x1 = x + w / 2; area.x2 = x + w - 2;
+        area.y1 = y + 1; area.y2 = y + h - 2;
+        lv_draw_rect(layer, &draw, &area);
+    }
+}
+static void draw_history_grid(lv_event_t *event) {
+    lv_obj_t *obj = lv_event_get_target_obj(event);
+    lv_area_t box;
+    lv_obj_get_coords(obj, &box);
+    const reset_ui_model_t *m = &previous;
+    lv_layer_t *layer = lv_event_get_layer(event);
+    /* One bounded draw object owns the quiet frame, cells and legend keys. */
+    lv_draw_rect_dsc_t panel;
+    lv_draw_rect_dsc_init(&panel);
+    panel.radius = 12;
+    panel.bg_opa = LV_OPA_COVER;
+    panel.bg_color = lv_color_hex(WHITE);
+    panel.border_width = 1;
+    panel.border_color = lv_color_hex(0xC8BEAD);
+    lv_area_t area = {box.x1 + RESET_UI_HISTORY_PANEL_X, box.y1 + RESET_UI_HISTORY_PANEL_Y,
+                     box.x1 + RESET_UI_HISTORY_PANEL_X + RESET_UI_HISTORY_PANEL_W - 1,
+                     box.y1 + RESET_UI_HISTORY_PANEL_Y + RESET_UI_HISTORY_PANEL_H - 1};
+    lv_draw_rect(layer, &panel, &area);
+    for (unsigned i = 0; i < RESET_HISTORY_DAYS; ++i)
+        history_cell(layer, box.x1 + RESET_UI_HISTORY_GRID_X + (i / 7) * RESET_UI_HISTORY_COLUMN_PITCH,
+                     box.y1 + RESET_UI_HISTORY_GRID_Y + (i % 7) * RESET_UI_HISTORY_ROW_PITCH,
+                     RESET_UI_HISTORY_CELL_SIZE, RESET_UI_HISTORY_CELL_SIZE, m->history_cells[i]);
+    history_cell(layer, box.x1 + 35, box.y1 + RESET_UI_HISTORY_LEGEND_Y + 3, 8, 8, RESET_HISTORY_DAY_REGULAR);
+    history_cell(layer, box.x1 + 95, box.y1 + RESET_UI_HISTORY_LEGEND_Y + 3, 8, 8, RESET_HISTORY_DAY_BANKED);
+    history_cell(layer, box.x1 + 155, box.y1 + RESET_UI_HISTORY_LEGEND_Y + 3, 8, 8, RESET_HISTORY_DAY_EMPTY);
+    history_cell(layer, box.x1 + 67, box.y1 + RESET_UI_HISTORY_SECOND_LEGEND_Y + 3, 8, 8, RESET_HISTORY_DAY_UNKNOWN);
+    history_cell(layer, box.x1 + 137, box.y1 + RESET_UI_HISTORY_SECOND_LEGEND_Y + 3, 8, 8, RESET_HISTORY_DAY_FUTURE);
+}
+static void history_page(const reset_ui_model_t *m) {
+    title("重置历史");
+    small(24, 79, 134, m->history_range, MUTED);
+    small(159, 79, 60, m->history_note, MUTED);
+    lv_obj_t *grid = lv_obj_create(content);
+    lv_obj_remove_style_all(grid);
+    lv_obj_set_size(grid, 240, 320);
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(grid, draw_history_grid, LV_EVENT_DRAW_MAIN, NULL);
+    lv_obj_t *weekdays = label(RESET_UI_HISTORY_WEEKDAY_X, RESET_UI_HISTORY_GRID_Y, 16, "一\n二\n三\n四\n五\n六\n日", &reset_font_12, MUTED);
+    /* Keep the seven row labels in one object and align unchanged-size text
+     * with the more widely spaced cell centres. */
+    lv_obj_set_style_text_line_space(weekdays, RESET_UI_HISTORY_ROW_PITCH - reset_font_12.line_height, 0);
+    for (unsigned col = 0; col < RESET_HISTORY_WEEKS; ++col) {
+        int x = RESET_UI_HISTORY_GRID_X + col * RESET_UI_HISTORY_COLUMN_PITCH;
+        if (x > RESET_UI_HISTORY_MONTH_MAX_X) x = RESET_UI_HISTORY_MONTH_MAX_X;
+        if (m->history_months[col][0]) small(x, RESET_UI_HISTORY_MONTH_Y, 30, m->history_months[col], MUTED);
+    }
+    small(48, RESET_UI_HISTORY_LEGEND_Y, 40, "常规", SECONDARY);
+    small(108, RESET_UI_HISTORY_LEGEND_Y, 40, "备用", SECONDARY);
+    small(168, RESET_UI_HISTORY_LEGEND_Y, 48, "无重置", SECONDARY);
+    small(80, RESET_UI_HISTORY_SECOND_LEGEND_Y, 40, "未知", MUTED);
+    small(150, RESET_UI_HISTORY_SECOND_LEGEND_Y, 40, "未来", MUTED);
+}
+
 static lv_obj_t *hold_label(int y, const char *value, const lv_font_t *font, uint32_t color) {
     lv_obj_t *obj = lv_label_create(hold_overlay);
     lv_obj_remove_style_all(obj);
@@ -245,38 +430,61 @@ void reset_ui_update(const reset_ui_model_t *m) {
     reset_text_layout(m->announcement_text, sizeof(m->announcement_text), m->announcement_truncated,
                       font_advance, (void *)&reset_font_16, RESET_TEXT_WIDTH, &announcement);
     if (m->page == RESET_UI_HOME) {
-        title("最新重置公告");
-        rect(18, 78, 202, 138, WHITE, 12, true);
-        small(30, 87, 178, m->announcement_type, SECONDARY);
-        rect(29, 113, 180, 49, SUN, 8, false);
-        label(37, 125, 168, !strcmp(m->announcement_age, "时间暂未公布") ? "--" : m->announcement_age,
-              &reset_font_24, INK);
-        label(30, 174, 178, m->announcement_date, &lv_font_montserrat_14, INK);
-        small(30, 196, 178, m->zone, MUTED);
-        rect(18, 226, 202, 57, SKY, 10, true);
-        bool shortened = reset_text_fit(m->next_body, sizeof(m->next_body), 2, font_advance,
-                                         (void *)&reset_font_12, 178, next_text, sizeof(next_text));
-        snprintf(next_heading, sizeof(next_heading), "%.47s", m->timing_is_forecast && (shortened || m->next_truncated) ?
-                 "预测摘录 · 有省略或字形替换" : m->next_title);
-        small(30, 231, 178, next_heading, SECONDARY);
-        small(30, 249, 178, next_text, INK);
-        footer(m->freshness, m->warning);
-    } else if (m->page == RESET_UI_OVERVIEW) {
         title("重置概览");
-        rect(18, 86, 202, 176, WHITE, 12, true);
-        small(30, 97, 178, m->status, SECONDARY);
-        rect(29, 124, 180, 54, SUN, 8, false);
-        label(37, 135, 168, m->hero, &reset_font_24, INK);
-        label(30, 190, 178, m->date, &lv_font_montserrat_14, INK);
-        small(30, 214, 178, m->zone, MUTED);
-        small(30, 240, 178, "时间依站点记录", SECONDARY);
-        small(23, 274, 194, m->detail_type, SECONDARY);
-        footer("第三方汇总 · 非个人额度", false);
+        snprintf(latest_heading, sizeof(latest_heading), "最近一次 · %.47s", m->detail_type);
+        if (m->primary_scheduled) {
+            /* Future always stays above history, and the large card owns the reader. */
+            /* Colours identify the event, not whichever card is currently big. */
+            rect(18, 78, 202, 138, SKY, 12, true);
+            snprintf(future_heading, sizeof(future_heading), "下一次 · %.47s", m->next_status);
+            small(30, 87, 178, future_heading, SECONDARY);
+            lv_obj_t *future_time = rect(29, 113, 180, 49, FUTURE_TIME, 8, false);
+            lv_obj_set_style_border_color(future_time, lv_color_hex(FUTURE_TIME_EDGE), 0);
+            time_label(37, 113, 168, 49, m->next_time,
+                       m->next_has_time ? &lv_font_montserrat_32 : &reset_font_16);
+            label(30, 174, 178, m->next_date, &lv_font_montserrat_14, INK);
+            small(30, 196, 178, m->zone, MUTED);
+            rect(18, 226, 202, 57, WHITE, 10, true);
+            small(30, 232, 178, latest_heading, SECONDARY);
+            rect(29, 251, 180, 25, SUN, 6, false);
+            time_label(37, 251, 168, 25, m->latest_available ? m->hero : "暂无记录", &reset_font_16);
+        } else {
+            rect(18, 78, 202, 57, SKY, 10, true);
+            small(30, 84, 178, "下一次重置", SECONDARY);
+            if (m->timing_is_forecast) {
+                if (m->forecast_confidence >= 0 && m->forecast_confidence <= 100)
+                    snprintf(forecast_input, sizeof(forecast_input), "预测 %d%%：%.127s", m->forecast_confidence, m->next_body);
+                else snprintf(forecast_input, sizeof(forecast_input), "预测：%.127s", m->next_body);
+                bool shortened = reset_text_fit(forecast_input, sizeof(forecast_input), 2, font_advance,
+                                                 (void *)&reset_font_12, 178, next_text, sizeof(next_text));
+                if (shortened || m->next_truncated) {
+                    snprintf(forecast_input, sizeof(forecast_input), "预测(省略/替换)：%.127s", m->next_body);
+                    reset_text_fit(forecast_input, sizeof(forecast_input), 2, font_advance,
+                                   (void *)&reset_font_12, 178, next_text, sizeof(next_text));
+                }
+                small(30, 102, 178, next_text, INK);
+            } else text(30, 106, 178, "暂未公布", INK);
+            rect(18, 145, 202, 138, WHITE, 12, true);
+            small(30, 154, 178, latest_heading, SECONDARY);
+            rect(29, 180, 180, 49, SUN, 8, false);
+            time_label(37, 180, 168, 49, m->latest_available ? m->hero : "暂无记录",
+                       m->latest_available ? &reset_font_24 : &reset_font_16);
+            label(30, 241, 178, m->date, &lv_font_montserrat_14, INK);
+            small(30, 263, 178, m->zone, MUTED);
+        }
+        footer(m->freshness, m->warning);
+    } else if (m->page == RESET_UI_HISTORY) {
+        history_page(m);
     } else if (m->page == RESET_UI_READING) {
-        title("公告原文");
-        unsigned page = m->reading_page < announcement.page_count ? m->reading_page : announcement.page_count - 1U;
-        snprintf(reading_number, sizeof(reading_number), "%u/%u", page + 1U, announcement.page_count);
+        unsigned page = m->reading_page < reset_ui_reading_page_count() ? m->reading_page : announcement.page_count;
+        snprintf(reading_number, sizeof(reading_number), "%u/%u", page + 1U, reset_ui_reading_page_count());
         label(186, 54, 36, reading_number, &lv_font_montserrat_12, MUTED);
+        if (page == announcement.page_count) {
+            source_page(m);
+            footer("上下翻页 · 确认返回", false);
+            return;
+        }
+        title("公告原文");
         snprintf(reading_meta, sizeof(reading_meta), "%.47s  %.31s", m->announcement_date, m->zone);
         small(24, 83, 192, reading_meta, MUTED);
         text(30, 107, 178, announcement.pages[page], INK);
@@ -286,16 +494,16 @@ void reset_ui_update(const reset_ui_model_t *m) {
                  announcement.source_truncated ? "仅保留前256字节 · 请查看站点" :
                  announcement.glyph_substituted ? "部分字形已替换为 ?" : "");
         if (reading_notice[0]) small(24, 275, 192, reading_notice, ALERT);
-        small(24, 295, 192, "codex-resets.com", MUTED);
+        small(24, 295, 192, "Codex Resets", MUTED);
     } else if (m->page == RESET_UI_STATS) {
         title("站点统计");
         full_stat(86, SUN, "累计已执行重置", m->stats_total);
-        full_stat(151, ROSE, "平均间隔 · 天", m->stats_average);
+        full_stat(151, ROSE, "历史平均间隔 · 天", m->stats_average);
         full_stat(216, SKY, "距上次 · 天", m->stats_elapsed);
         footer("上下翻页 · 长按确认休眠", false);
     } else if (m->page == RESET_UI_SETTINGS) {
         title("设备设置");
-        static const char *names[] = {"Wi-Fi", "自动同步", "固定时差", "屏幕亮度", "自动休眠", "蓝牙配网", "返回公告"};
+        static const char *names[] = {"Wi-Fi", "自动同步", "固定时差", "屏幕亮度", "自动熄屏", "蓝牙配网", "返回概览"};
         for (int i = 0; i < 7; ++i) {
             int y = 84 + 28 * i;
             if (m->settings_editing && m->selected_setting == i) rect(18, y - 4, 202, 26, SUN, 7, false);

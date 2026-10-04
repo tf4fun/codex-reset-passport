@@ -3,14 +3,21 @@
 #include <stdbool.h>
 typedef enum { RESET_INPUT_UP, RESET_INPUT_DOWN, RESET_INPUT_OK, RESET_INPUT_OK_LONG } reset_input_t;
 typedef enum {
-    RESET_ACTION_NONE, RESET_ACTION_REFRESH, RESET_ACTION_CHANGE_SETTING,
+    RESET_ACTION_NONE, RESET_ACTION_REFRESH, RESET_ACTION_HISTORY_REFRESH, RESET_ACTION_CHANGE_SETTING,
     RESET_ACTION_READING_OPEN, RESET_ACTION_READING_PREVIOUS, RESET_ACTION_READING_NEXT,
     RESET_ACTION_TIMEZONE_UP, RESET_ACTION_TIMEZONE_DOWN, RESET_ACTION_TIMEZONE_SAVE,
     RESET_ACTION_START_SETUP, RESET_ACTION_STOP_SETUP, RESET_ACTION_CLEAR,
     RESET_ACTION_SLEEP, RESET_ACTION_CANCEL_SLEEP
 } reset_action_t;
-typedef struct { reset_ui_page_t page; unsigned selected; bool editing; } reset_controls_t;
+typedef struct {
+    reset_ui_page_t page;
+    reset_ui_page_t reader_parent; /* Captured entry page; currently the unified HOME. */
+    unsigned selected;
+    bool editing;
+} reset_controls_t;
 reset_action_t reset_controls_handle(reset_controls_t *state, reset_input_t input);
+/* Gate entry against the last actually rendered home snapshot, not newer data. */
+bool reset_controls_admit_reader(reset_controls_t *state, reset_ui_page_t displayed_page, bool snapshot_available);
 
 /* Longer than the board single-click delay: consume the wake/cancel key. */
 #define RESET_WAKE_RELEASE_GUARD_MS UINT64_C(250)

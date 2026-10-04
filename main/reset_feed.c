@@ -43,7 +43,7 @@ static bool valid_utf8(const char *text, size_t length)
     return true;
 }
 
-static bool json_preflight(const char *json, size_t length)
+static bool json_preflight_limit(const char *json, size_t length, unsigned max_tokens)
 {
     if (!valid_utf8(json, length)) return false;
     unsigned depth = 0;
@@ -64,18 +64,23 @@ static bool json_preflight(const char *json, size_t length)
             }
         } else if (c == '"') {
             quoted = true;
-            if (++tokens > RESET_JSON_MAX_TOKENS) return false;
+            if (++tokens > max_tokens) return false;
         } else if (c == '{' || c == '[') {
             if (++depth > RESET_JSON_MAX_DEPTH ||
-                ++tokens > RESET_JSON_MAX_TOKENS) return false;
+                ++tokens > max_tokens) return false;
         } else if (c == '}' || c == ']') {
             if (depth == 0) return false;
             --depth;
         } else if (c == ',' || c == ':') {
-            if (++tokens > RESET_JSON_MAX_TOKENS) return false;
+            if (++tokens > max_tokens) return false;
         }
     }
     return !quoted && depth == 0;
+}
+
+static bool json_preflight(const char *json, size_t length)
+{
+    return json_preflight_limit(json, length, RESET_JSON_MAX_TOKENS);
 }
 
 static bool unique_keys(const cJSON *node)
@@ -201,9 +206,51 @@ static bool valid_source(const cJSON *object)
     /* Observations can legitimately have no author or source URL. */
     if (strcmp(type, "observed") == 0) return true;
     const char *author = string_field(source, "author");
-    const char *url = string_field(source, "url");
     return strcmp(type, "x_post") == 0 && author &&
-           strcmp(author, "thsottiaux") == 0 && url && strncmp(url, "https://", 8) == 0;
+           strcmp(author, "thsottiaux") == 0;
+}
+
+bool reset_feed_source_url_valid(const char *url, size_t capacity)
+{
+    if (!url || !capacity) return false;
+    size_t bound = capacity;
+    if (bound > RESET_FEED_SOURCE_URL_MAX_BYTES + 1U) {
+        bound = RESET_FEED_SOURCE_URL_MAX_BYTES + 1U;
+    }
+    const char *end = memchr(url, '\0', bound);
+    if (!end) return false;
+    size_t length = (size_t)(end - url);
+    if (length <= 8 || memcmp(url, "https://", 8) != 0) return false;
+    for (size_t i = 0; i < length; ++i) {
+        unsigned char c = (unsigned char)url[i];
+        /* A scanner must not reinterpret whitespace or backslashes as URL
+         * separators. Only printable ASCII survives, byte-for-byte. */
+        if (c <= 0x20 || c >= 0x7f || c == '\\') return false;
+    }
+    const char *host = url + 8;
+    const char *host_end = host;
+    while (host_end < end && *host_end != '/' && *host_end != '?' && *host_end != '#') ++host_end;
+    size_t host_length = (size_t)(host_end - host);
+    static const char *const allowed_hosts[] = {
+        "x.com", "www.x.com", "twitter.com", "www.twitter.com", "codex-resets.com",
+    };
+    for (size_t i = 0; i < sizeof(allowed_hosts) / sizeof(allowed_hosts[0]); ++i) {
+        if (host_length == strlen(allowed_hosts[i]) &&
+            memcmp(host, allowed_hosts[i], host_length) == 0) return true;
+    }
+    /* Exact authority matching also excludes userinfo, ports, encoded host
+     * names, suffix attacks, lookalikes, and unexpected subdomains. */
+    return false;
+}
+
+static void copy_source_url(const cJSON *object, bool observed, char *out)
+{
+    out[0] = '\0';
+    if (observed) return;
+    const char *url = string_field(field(object, "source"), "url");
+    if (url && reset_feed_source_url_valid(url, strlen(url) + 1U)) {
+        memcpy(out, url, strlen(url) + 1U);
+    }
 }
 
 static bool valid_id(const char *id)
@@ -255,6 +302,7 @@ static bool parse_latest(const cJSON *object, reset_announcement_t *out)
                       &out->text_truncated, &out->text_has_non_ascii) || !valid_source(object)) return false;
     memcpy(out->id, id, strlen(id) + 1);
     out->observed = strcmp(string_field(field(object, "source"), "type"), "observed") == 0;
+    copy_source_url(object, out->observed, out->source_url);
     out->present = true;
     return true;
 }
@@ -277,6 +325,7 @@ static bool parse_schedule(const cJSON *object, reset_schedule_t *out)
     }
     memcpy(out->id, id, strlen(id) + 1);
     out->observed = strcmp(string_field(field(object, "source"), "type"), "observed") == 0;
+    copy_source_url(object, out->observed, out->source_url);
     out->present = true;
     return true;
 }
@@ -367,6 +416,100 @@ bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out)
              candidate.watch.observed_at <= candidate.generated_at + 300);
     cJSON_Delete(root);
     if (valid) *out = candidate;
+    return valid;
+}
+
+static uint64_t history_hash(const char *text)
+{
+    uint64_t value = UINT64_C(14695981039346656037);
+    for (; *text; ++text) value = (value ^ (unsigned char)*text) * UINT64_C(1099511628211);
+    return value;
+}
+
+bool reset_history_parse_page(reset_history_accumulator_t *state,
+                              const char *json, size_t length)
+{
+    if (!state) return false;
+    if (state->failed || state->complete || state->pages >= RESET_HISTORY_MAX_PAGES ||
+        state->item_count > RESET_HISTORY_PAGE_LIMIT * RESET_HISTORY_MAX_PAGES ||
+        !state->has_more || !state->data.start_day ||
+        state->data.start_day != reset_history_window_start(state->data.through_at) ||
+        !json || !length || length > RESET_FEED_BODY_LIMIT ||
+        !json_preflight_limit(json, length, 1536U)) {
+        state->failed = true;
+        state->complete = false;
+        return false;
+    }
+    const char *end = NULL;
+    cJSON *root = cJSON_ParseWithLengthOpts(json, length, &end, false);
+    if (!root) { state->failed = true; return false; }
+    while (end < json + length && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) ++end;
+    const cJSON *data = field(root, "data");
+    const cJSON *pagination = field(root, "pagination");
+    const cJSON *more = field(pagination, "has_more");
+    const cJSON *cursor = field(pagination, "next_cursor");
+    const cJSON *meta = field(root, "meta");
+    const char *version = string_field(meta, "api_version");
+    int64_t generated_at = 0;
+    bool valid = cJSON_IsObject(root) && end == json + length && unique_keys(root) &&
+                 cJSON_IsArray(data) && cJSON_IsObject(pagination) && cJSON_IsBool(more) &&
+                 cJSON_IsObject(meta) && version && strcmp(version, "v1") == 0 &&
+                 timestamp_field(meta, "generated_at", &generated_at) &&
+                 generated_at >= state->data.through_at - 300 &&
+                 generated_at <= state->data.through_at + 600;
+    bool has_more = cJSON_IsTrue(more);
+    int count = cJSON_GetArraySize(data);
+    valid = valid && count <= (int)RESET_HISTORY_PAGE_LIMIT &&
+            state->item_count + (unsigned)count <= RESET_HISTORY_PAGE_LIMIT * RESET_HISTORY_MAX_PAGES &&
+            (has_more ? (count > 0 && cJSON_IsString(cursor) &&
+                         reset_history_cursor_valid(cursor->valuestring)) : cJSON_IsNull(cursor));
+    uint64_t cursor_hash = 0;
+    if (valid && has_more) {
+        cursor_hash = history_hash(cursor->valuestring);
+        for (unsigned i = 0; i < state->pages; ++i) {
+            if (state->cursors[i] == cursor_hash) valid = false;
+        }
+        /* A page limit is an incomplete result, never an empty calendar. */
+        if (state->pages + 1 >= RESET_HISTORY_MAX_PAGES) valid = false;
+    }
+    const cJSON *item;
+    cJSON_ArrayForEach(item, data) {
+        if (!valid) break;
+        reset_announcement_t announcement = {0};
+        valid = parse_latest(item, &announcement) && announcement.present &&
+                announcement.announced_at >= state->data.start_day &&
+                announcement.announced_at <= state->data.through_at &&
+                announcement.announced_at <= generated_at + 300 &&
+                announcement.announced_at >= state->last_announced_at;
+        if (!valid) break;
+        uint64_t hash = history_hash(announcement.id);
+        for (unsigned i = 0; i < state->item_count; ++i) {
+            if (state->ids[i] == hash) valid = false;
+        }
+        if (!valid) break;
+        state->ids[state->item_count++] = hash;
+        state->last_announced_at = announcement.announced_at;
+        unsigned day = (unsigned)((announcement.announced_at - state->data.start_day) / INT64_C(86400));
+        state->data.cells[day] |= announcement.kind == RESET_KIND_REGULAR ?
+                                 RESET_HISTORY_REGULAR : RESET_HISTORY_BANKED;
+    }
+    if (valid) {
+        state->cursors[state->pages++] = cursor_hash;
+        state->has_more = has_more;
+        if (has_more) memcpy(state->next_cursor, cursor->valuestring, strlen(cursor->valuestring) + 1U);
+        else {
+            state->next_cursor[0] = '\0';
+            for (unsigned i = 0; i < RESET_HISTORY_DAYS; ++i) {
+                if (state->data.start_day + (int64_t)i * INT64_C(86400) <= state->data.through_at) {
+                    state->data.cells[i] |= RESET_HISTORY_KNOWN;
+                }
+            }
+            state->complete = reset_history_data_valid(&state->data);
+            valid = state->complete;
+        }
+    }
+    cJSON_Delete(root);
+    if (!valid) { state->failed = true; state->complete = false; }
     return valid;
 }
 
@@ -537,6 +680,13 @@ static bool s_clock_ready;
 static bool s_fetching;
 static bool s_paused;
 static bool s_refresh_pending;
+static bool s_history_pending;
+static bool s_history_fetching;
+static bool s_history_needs_verification;
+static reset_history_snapshot_t s_history;
+/* One worker owns these bounded work buffers; never on its TLS call stack. */
+static reset_history_accumulator_t s_history_staging;
+static char s_history_url[RESET_HISTORY_URL_CAPACITY];
 static bool s_cache_needs_verification;
 static bool s_restore_pending;
 static int64_t s_restore_hard_backoff_at;
@@ -606,22 +756,35 @@ static bool transport_ready(void)
 {
     bool ready;
     taskENTER_CRITICAL(&s_lock);
-    ready = s_wifi_ready && s_clock_ready;
+    ready = s_wifi_ready && s_clock_ready && !s_paused;
     taskEXIT_CRITICAL(&s_lock);
     /* A sanity check complements, but never replaces, an actual SNTP sync. */
     return ready && (int64_t)time(NULL) >= INT64_C(1704067200);
 }
 
-static void fetch_status(response_t *response)
+static int request_timeout(uint64_t started)
+{
+    uint64_t now = monotonic_ms();
+    if (now < started || now - started >= RESET_HTTP_TOTAL_MS || !transport_ready()) return 0;
+    uint64_t remaining = RESET_HTTP_TOTAL_MS - (now - started);
+    return remaining < RESET_HTTP_TIMEOUT_MS ? (int)remaining : RESET_HTTP_TIMEOUT_MS;
+}
+
+/* One client/TLS allocation at a time, shared by status and history. Every
+ * history page receives the SAME cycle start, bounding the whole cycle to30s
+ * rather than granting a fresh30s budget for each cursor. */
+static void fetch_http(response_t *response, const char *url, bool conditional,
+                       reset_history_accumulator_t *history, uint64_t started)
 {
     memset(response, 0, sizeof(*response));
     response->error = RESET_FEED_ERROR_NETWORK;
-    if (!transport_ready()) return;
+    int timeout = request_timeout(started);
+    if (!timeout) return;
     const esp_http_client_config_t config = {
-        .url = RESET_FEED_URL,
+        .url = url,
         .method = HTTP_METHOD_GET,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .timeout_ms = RESET_HTTP_TIMEOUT_MS,
+        .timeout_ms = timeout,
         .disable_auto_redirect = true,
         .max_authorization_retries = -1,
         .buffer_size = 1024,
@@ -638,16 +801,19 @@ static void fetch_status(response_t *response)
         return;
     }
     char *body = NULL;
-    uint64_t started = monotonic_ms();
     if (esp_http_client_set_header(client, "Accept", "application/json") != ESP_OK ||
         esp_http_client_set_header(client, "Accept-Encoding", "identity") != ESP_OK ||
-        (s_etag[0] && esp_http_client_set_header(client, "If-None-Match", s_etag) != ESP_OK) ||
+        (conditional && s_etag[0] && esp_http_client_set_header(client, "If-None-Match", s_etag) != ESP_OK)) goto cleanup;
+    timeout = request_timeout(started);
+    if (!timeout || esp_http_client_set_timeout_ms(client, timeout) != ESP_OK ||
         esp_http_client_open(client, 0) != ESP_OK) goto cleanup;
+    timeout = request_timeout(started);
+    if (!timeout || esp_http_client_set_timeout_ms(client, timeout) != ESP_OK) goto cleanup;
     int64_t content_length = esp_http_client_fetch_headers(client);
     if (content_length < 0) goto cleanup;
     response->http_status = esp_http_client_get_status_code(client);
     if (response->http_status == 304) {
-        if (s_etag[0]) {
+        if (conditional && s_etag[0]) {
             response->unchanged = true;
             response->error = RESET_FEED_ERROR_NONE;
         } else {
@@ -677,11 +843,8 @@ static void fetch_status(response_t *response)
     /* fetch_headers may already have cached the whole response. Always drain
      * read(), even when the parser reports that all wire bytes have arrived. */
     for (;;) {
-        uint64_t elapsed = monotonic_ms() - started;
-        if (elapsed >= RESET_HTTP_TOTAL_MS || !transport_ready()) goto cleanup;
-        uint64_t remaining = RESET_HTTP_TOTAL_MS - elapsed;
-        int timeout = remaining < RESET_HTTP_TIMEOUT_MS ? (int)remaining : RESET_HTTP_TIMEOUT_MS;
-        if (esp_http_client_set_timeout_ms(client, timeout) != ESP_OK) goto cleanup;
+        timeout = request_timeout(started);
+        if (!timeout || esp_http_client_set_timeout_ms(client, timeout) != ESP_OK) goto cleanup;
         /* The extra byte detects oversize bodies even with no Content-Length. */
         size_t room = RESET_FEED_BODY_LIMIT + 1U - used;
         int count = esp_http_client_read(client, body + used, room < 1024 ? (int)room : 1024);
@@ -697,15 +860,47 @@ static void fetch_status(response_t *response)
         }
     }
     body[used] = '\0';
-    response->error = reset_feed_parse(body, used, &response->data) ?
-                      RESET_FEED_ERROR_NONE : RESET_FEED_ERROR_FORMAT;
-    if (response->error == RESET_FEED_ERROR_NONE &&
+    /* Release TLS and transport buffers before cJSON allocates nodes. Retain
+     * only the bounded response body and already-copied header values. */
+    esp_http_client_cleanup(client);
+    client = NULL;
+    if (!request_timeout(started)) goto cleanup;
+    bool parsed = history ? reset_history_parse_page(history, body, used) :
+                            reset_feed_parse(body, used, &response->data);
+    response->error = parsed ? RESET_FEED_ERROR_NONE : RESET_FEED_ERROR_FORMAT;
+    if (!history && response->error == RESET_FEED_ERROR_NONE &&
         response->data.generated_at > (int64_t)time(NULL) + 600) {
         response->error = RESET_FEED_ERROR_FORMAT;
     }
 cleanup:
     free(body);
-    esp_http_client_cleanup(client);
+    if (client) esp_http_client_cleanup(client);
+}
+
+static void fetch_status(response_t *response)
+{
+    fetch_http(response, RESET_FEED_URL, true, NULL, monotonic_ms());
+}
+
+static void fetch_history(response_t *response)
+{
+    uint64_t started = monotonic_ms();
+    memset(response, 0, sizeof(*response));
+    response->error = RESET_FEED_ERROR_FORMAT;
+    if (!reset_history_begin(&s_history_staging, (int64_t)time(NULL))) return;
+    do {
+        const char *cursor = s_history_staging.pages ? s_history_staging.next_cursor : NULL;
+        if (!reset_history_build_url(&s_history_staging.data, cursor,
+                                     s_history_url, sizeof(s_history_url))) {
+            response->error = RESET_FEED_ERROR_FORMAT;
+            return;
+        }
+        fetch_http(response, s_history_url, false, &s_history_staging, started);
+        if (response->error != RESET_FEED_ERROR_NONE) return;
+    } while (s_history_staging.has_more);
+    if (!s_history_staging.complete || !request_timeout(started)) {
+        response->error = RESET_FEED_ERROR_NETWORK;
+    }
 }
 
 static void apply_response(const response_t *response, uint64_t now_ms, int64_t wall_now)
@@ -731,6 +926,45 @@ static void apply_response(const response_t *response, uint64_t now_ms, int64_t 
     s_refresh_pending = false;
     reset_feed_poll_complete(&s_poll, now_ms, success, response->headers.retry_after);
     taskEXIT_CRITICAL(&s_lock);
+}
+
+static void apply_history_response(const response_t *response, uint64_t now_ms, int64_t wall_now)
+{
+    taskENTER_CRITICAL(&s_lock);
+    bool success = response->error == RESET_FEED_ERROR_NONE &&
+                   s_history_staging.complete && !s_history_staging.failed &&
+                   s_wifi_ready && s_clock_ready && !s_paused;
+    if (success) {
+        s_history.data = s_history_staging.data;
+        s_history.has_data = true;
+        s_history.last_checked_at = wall_now;
+        s_history_needs_verification = false;
+    } else {
+        s_history_needs_verification = true;
+    }
+    s_history.error = success ? RESET_FEED_ERROR_NONE :
+                      response->error == RESET_FEED_ERROR_NONE ? RESET_FEED_ERROR_NETWORK : response->error;
+    s_history.http_status = response->http_status;
+    s_history_fetching = false;
+    s_fetching = false;
+    /* A history success must not postpone an already-due status check. Errors
+     * and 429 share the same global backoff across both endpoints. */
+    uint64_t status_deadline = s_poll.next_attempt_ms;
+    reset_feed_poll_complete(&s_poll, now_ms, success, response->headers.retry_after);
+    if (success) s_poll.next_attempt_ms = status_deadline;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static bool history_fresh_locked(int64_t wall_now)
+{
+    return s_history.has_data && !s_history_needs_verification &&
+           s_history.error == RESET_FEED_ERROR_NONE &&
+           wall_now >= s_history.last_checked_at &&
+           wall_now - s_history.last_checked_at < RESET_HISTORY_FRESH_SECONDS &&
+           s_history.data.start_day == reset_history_window_start(wall_now) &&
+           s_history.data.through_at / INT64_C(86400) == wall_now / INT64_C(86400) &&
+           (!s_snapshot.has_data || !s_snapshot.data.latest.present ||
+            s_snapshot.data.latest.announced_at <= s_history.data.through_at);
 }
 
 static uint64_t remaining_ms(uint64_t deadline, uint64_t now)
@@ -804,13 +1038,39 @@ static bool admit_fetch(uint64_t now, int64_t wall_now)
     return due;
 }
 
+static bool admit_history(uint64_t now, int64_t wall_now)
+{
+    bool due = false;
+    taskENTER_CRITICAL(&s_lock);
+    restore_policy_locked(now, wall_now);
+    if (s_history_pending && !s_paused && !s_fetching && s_wifi_ready && s_clock_ready &&
+        wall_now >= INT64_C(1704067200) && !s_restore_pending &&
+        reset_feed_poll_manual_due(&s_poll, now)) {
+        s_history_pending = false;
+        if (!history_fresh_locked(wall_now)) {
+            s_fetching = true;
+            s_history_fetching = true;
+            /* This global attempt timestamp also preserves debounce in RTC. */
+            s_snapshot.last_attempt_at = wall_now;
+            reset_feed_poll_begin(&s_poll, now);
+            due = true;
+        }
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    return due;
+}
+
 static void feed_worker(void *arg)
 {
     (void)arg;
     for (;;) {
         uint64_t now = monotonic_ms();
         int64_t wall_now = (int64_t)time(NULL);
-        if (admit_fetch(now, wall_now)) {
+        if (admit_history(now, wall_now)) {
+            response_t response;
+            fetch_history(&response);
+            apply_history_response(&response, monotonic_ms(), (int64_t)time(NULL));
+        } else if (admit_fetch(now, wall_now)) {
             response_t response;
             fetch_status(&response);
             now = monotonic_ms();
@@ -820,7 +1080,7 @@ static void feed_worker(void *arg)
         now = monotonic_ms();
         taskENTER_CRITICAL(&s_lock);
         bool ready = s_wifi_ready && s_clock_ready && !s_paused;
-        uint64_t deadline = s_refresh_pending ? 0 : s_poll.next_attempt_ms;
+        uint64_t deadline = s_refresh_pending || s_history_pending ? 0 : s_poll.next_attempt_ms;
         if (s_poll.hard_backoff_until_ms > deadline) deadline = s_poll.hard_backoff_until_ms;
         if (s_poll.debounce_until_ms > deadline) deadline = s_poll.debounce_until_ms;
         uint64_t delay = deadline > now ? deadline - now : 1000;
@@ -884,10 +1144,47 @@ bool reset_feed_request_refresh(void)
     return allowed;
 }
 
+bool reset_feed_request_history(void)
+{
+    TaskHandle_t worker;
+    bool allowed;
+    int64_t wall_now = (int64_t)time(NULL);
+    taskENTER_CRITICAL(&s_lock);
+    worker = s_worker;
+    allowed = worker && !s_paused;
+    if (allowed && !s_history_fetching && !history_fresh_locked(wall_now)) s_history_pending = true;
+    taskEXIT_CRITICAL(&s_lock);
+    if (allowed) xTaskNotifyGive(worker);
+    return allowed;
+}
+
 static uint32_t bounded_seconds(uint64_t milliseconds)
 {
     uint64_t seconds = rounded_seconds(milliseconds);
     return seconds > UINT32_MAX ? UINT32_MAX : (uint32_t)seconds;
+}
+
+void reset_feed_get_history_snapshot(reset_history_snapshot_t *out)
+{
+    if (!out) return;
+    uint64_t now = monotonic_ms();
+    int64_t wall_now = (int64_t)time(NULL);
+    taskENTER_CRITICAL(&s_lock);
+    restore_policy_locked(now, wall_now);
+    *out = s_history;
+    reset_history_project(s_history.has_data ? &s_history.data : NULL, wall_now, &out->data);
+    out->stale = !history_fresh_locked(wall_now);
+    out->loading = s_history_pending || s_history_fetching;
+    if (s_paused) out->status = RESET_FEED_PAUSED;
+    else if (!s_wifi_ready) out->status = RESET_FEED_WAITING_WIFI;
+    else if (!s_clock_ready || wall_now < INT64_C(1704067200)) out->status = RESET_FEED_WAITING_CLOCK;
+    else if (out->loading) out->status = RESET_FEED_FETCHING;
+    else if (s_history.error != RESET_FEED_ERROR_NONE) out->status = RESET_FEED_ERROR;
+    else out->status = RESET_FEED_CURRENT;
+    uint64_t deadline = s_poll.hard_backoff_until_ms > s_poll.debounce_until_ms ?
+                        s_poll.hard_backoff_until_ms : s_poll.debounce_until_ms;
+    out->retry_in_seconds = bounded_seconds(remaining_ms(deadline, now));
+    taskEXIT_CRITICAL(&s_lock);
 }
 
 void reset_feed_get_snapshot(reset_feed_snapshot_t *out)
@@ -955,6 +1252,7 @@ bool reset_feed_pause_and_wait(uint32_t timeout_ms)
     taskENTER_CRITICAL(&s_lock);
     s_paused = true;
     s_refresh_pending = false;
+    s_history_pending = false;
     worker = s_worker;
     taskEXIT_CRITICAL(&s_lock);
     if (worker) xTaskNotifyGive(worker);
@@ -984,9 +1282,9 @@ void reset_feed_resume(bool refresh_now)
 }
 
 #define RESET_RTC_MAGIC UINT32_C(0x52534632)
-/* Version 3 retains bounded source/forecast text and scheduled source identity.
- * Both this version and sizeof check reject pre-text layouts on wake. */
-#define RESET_RTC_VERSION 3U
+/* Version 5 retains the independently validated complete history cache.
+ * Both this version and sizeof check reject older cache layouts on wake. */
+#define RESET_RTC_VERSION 5U
 
 static uint32_t rtc_checksum(const reset_feed_rtc_state_t *state)
 {
@@ -1011,6 +1309,12 @@ static bool valid_rtc_text(const char *text, size_t capacity)
     return true;
 }
 
+static bool valid_rtc_source_url(const char *url, size_t capacity, bool observed)
+{
+    if (!memchr(url, '\0', capacity)) return false;
+    return url[0] == '\0' || (!observed && reset_feed_source_url_valid(url, capacity));
+}
+
 bool reset_feed_export_rtc(reset_feed_rtc_state_t *out)
 {
     if (!out) return false;
@@ -1033,6 +1337,11 @@ bool reset_feed_export_rtc(reset_feed_rtc_state_t *out)
     state.http_status = s_snapshot.http_status;
     state.last_checked_at = s_snapshot.last_checked_at;
     state.last_attempt_at = s_snapshot.last_attempt_at;
+    state.history = s_history.data;
+    state.has_history = s_history.has_data;
+    state.history_error = s_history.error;
+    state.history_http_status = s_history.http_status;
+    state.history_last_checked_at = s_history.last_checked_at;
     if (s_restore_pending) {
         state.hard_backoff_until = s_restore_hard_backoff_at;
         state.next_auto_at = s_restore_next_auto_at;
@@ -1059,13 +1368,23 @@ bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state)
 {
     if (!state || state->magic != RESET_RTC_MAGIC || state->version != RESET_RTC_VERSION ||
         state->size != sizeof(*state) || state->checksum != rtc_checksum(state) ||
-        state->has_data > 1 || state->failures > 5 ||
+        state->has_data > 1 || state->has_history > 1 || state->failures > 5 ||
         !reset_feed_interval_valid(state->auto_interval_minutes) ||
         state->error > RESET_FEED_ERROR_FORMAT || state->http_status < 0 || state->http_status > 599 ||
         state->last_checked_at < 0 || state->last_attempt_at < 0 ||
         state->hard_backoff_until < 0 || state->next_auto_at < 0 ||
+        state->history_error > RESET_FEED_ERROR_FORMAT ||
+        state->history_http_status < 0 || state->history_http_status > 599 ||
+        state->history_last_checked_at < 0 ||
+        (state->has_history && (!reset_history_data_valid(&state->history) ||
+             state->history_last_checked_at < state->history.through_at ||
+             state->history_last_checked_at >= INT64_C(4102444800))) ||
         !valid_rtc_text(state->data.latest.text, sizeof(state->data.latest.text)) ||
         !valid_rtc_text(state->data.scheduled.text, sizeof(state->data.scheduled.text)) ||
+        !valid_rtc_source_url(state->data.latest.source_url, sizeof(state->data.latest.source_url),
+                              state->data.latest.observed) ||
+        !valid_rtc_source_url(state->data.scheduled.source_url, sizeof(state->data.scheduled.source_url),
+                              state->data.scheduled.observed) ||
         !valid_rtc_text(state->data.watch.forecast_window, sizeof(state->data.watch.forecast_window)) ||
         (state->has_data && (state->last_checked_at == 0 ||
                             state->data.generated_at < INT64_C(1609459200) ||
@@ -1082,6 +1401,15 @@ bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state)
     s_snapshot.http_status = state->http_status;
     s_snapshot.last_checked_at = state->last_checked_at;
     s_snapshot.last_attempt_at = state->last_attempt_at;
+    memset(&s_history, 0, sizeof(s_history));
+    if (state->has_history) s_history.data = state->history;
+    s_history.has_data = state->has_history != 0;
+    s_history.error = (reset_feed_error_t)state->history_error;
+    s_history.http_status = state->history_http_status;
+    s_history.last_checked_at = state->history_last_checked_at;
+    s_history_needs_verification = state->has_history != 0;
+    s_history_pending = false;
+    s_history_fetching = false;
     memset(&s_poll, 0, sizeof(s_poll));
     s_poll.failures = state->failures;
     s_poll.auto_interval_minutes = state->auto_interval_minutes;

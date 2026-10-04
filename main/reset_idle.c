@@ -45,3 +45,35 @@ void reset_idle_defer_after_cancel_or_failure(reset_idle_t *s,
     reset_idle_observe(s, now_ms, false, s->paused);
     s->retry_remaining_ms = RESET_IDLE_RETRY_MS;
 }
+
+bool reset_idle_screen_tick(reset_idle_screen_t *screen, const reset_idle_t *idle,
+                            uint16_t minutes, uint64_t now_ms, bool activity) {
+    if (!screen || !idle) return false;
+    if (!minutes || activity) {
+        *screen = (reset_idle_screen_t){0};
+        return false;
+    }
+    if (!reset_idle_due(idle, minutes, now_ms)) {
+        screen->grace_active = false;
+        return false;
+    }
+    if (!screen->grace_active || now_ms < screen->grace_started_ms) {
+        screen->screen_off = true;
+        screen->grace_active = true;
+        screen->grace_started_ms = now_ms;
+        return false;
+    }
+    return now_ms - screen->grace_started_ms >= RESET_IDLE_GRACE_MS;
+}
+
+void reset_idle_screen_failed(reset_idle_screen_t *screen) {
+    if (screen) screen->grace_active = false;
+}
+
+int reset_idle_brightness(const reset_idle_screen_t *screen,
+                         const reset_idle_t *idle, int brightness) {
+    if (screen && screen->screen_off) return 0;
+    if (idle && !idle->paused && idle->elapsed_ms >= RESET_IDLE_DIM_MS)
+        return brightness < 8 ? brightness : 8;
+    return brightness;
+}

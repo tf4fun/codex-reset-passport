@@ -8,7 +8,7 @@ typedef struct {
     uint16_t interval_minutes;
     int16_t utc_offset_minutes; /* Explicit fixed offset, never inferred; no DST. */
     uint8_t brightness;
-    uint16_t sleep_minutes; /* 0 = off; otherwise 5, 10, or 30 idle minutes. */
+    uint16_t sleep_minutes; /* Persisted key unchanged: 0 = off; 5/10/30 minutes to screen-off. */
 } reset_settings_t;
 void reset_settings_defaults(reset_settings_t *settings);
 bool reset_settings_valid(const reset_settings_t *settings);

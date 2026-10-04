@@ -66,8 +66,22 @@ reset_action_t reset_controls_handle(reset_controls_t *s, reset_input_t input) {
     }
     if (input == RESET_INPUT_UP) s->page = (reset_ui_page_t)((s->page + 3) % 4);
     else if (input == RESET_INPUT_DOWN) s->page = (reset_ui_page_t)((s->page + 1) % 4);
-    else if (s->page == RESET_UI_HOME) { s->page = RESET_UI_READING; return RESET_ACTION_READING_OPEN; }
+    else if (s->page == RESET_UI_HOME) {
+        s->reader_parent = s->page;
+        s->page = RESET_UI_READING;
+        return RESET_ACTION_READING_OPEN;
+    }
     else if (s->page == RESET_UI_SETTINGS) s->editing = true;
+    else if (s->page == RESET_UI_HISTORY) return RESET_ACTION_HISTORY_REFRESH;
     else return RESET_ACTION_REFRESH;
     return RESET_ACTION_NONE;
+}
+
+bool reset_controls_admit_reader(reset_controls_t *s, reset_ui_page_t displayed_page, bool available) {
+    if (!s || s->page != RESET_UI_READING) return false;
+    if (s->reader_parent != RESET_UI_HOME || displayed_page != RESET_UI_HOME || !available) {
+        s->page = RESET_UI_HOME;
+        return false;
+    }
+    return true;
 }

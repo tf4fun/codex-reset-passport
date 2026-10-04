@@ -3,6 +3,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 // 按键索引。数量用 bsp_pins.h 的 BSP_BTN_COUNT(硬件属性,归引脚表管),
@@ -44,6 +45,13 @@ int bsp_button_read_mv(void);
 // attempt full button/callback restoration and remain awake. Returns the GPIO
 // number only on success. Does NOT configure or enter sleep.
 esp_err_t bsp_button_prepare_deep_sleep(uint32_t timeout_ms, int *wake_gpio);
+
+// Owner-task observation of the latest prepare call: true if either release
+// wait or deep_sleep_level check sampled a pressed/out-of-release level.
+// Survives restoration and init; only the next prepare call clears it. Automatic
+// sleep can treat this as a consumed wake gesture; manual sleep may retain its
+// wait-for-release behavior.
+bool bsp_button_deep_sleep_had_activity(void);
 
 // Idempotent pre-terminal rollback, retaining the original callback/user.
 // A restoration failure leaves resources owned and returns an error, never

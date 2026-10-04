@@ -63,15 +63,15 @@ run_static_checks() {
         "${test_dir}/test_demo_${demo}_runtime"
     done
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
-        tests/test_reset_presenter.c main/reset_presenter.c main/reset_settings.c \
+        tests/test_reset_presenter.c main/reset_presenter.c main/reset_settings.c main/reset_history.c \
         -o "${test_dir}/test_reset_presenter"
     "${test_dir}/test_reset_presenter"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain -Itests/vendor/cjson \
-        tests/test_reset_feed.c main/reset_feed.c tests/vendor/cjson/cJSON.c \
+        tests/test_reset_feed.c main/reset_feed.c main/reset_history.c tests/vendor/cjson/cJSON.c \
         -lm -o "${test_dir}/test_reset_feed"
     "${test_dir}/test_reset_feed"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Itests/reset_feed_stubs \
-        -Itests/vendor/cjson -Imain tests/test_reset_feed_http.c \
+        -Itests/vendor/cjson -Imain tests/test_reset_feed_http.c main/reset_history.c \
         tests/vendor/cjson/cJSON.c -lm -o "${test_dir}/test_reset_feed_http"
     "${test_dir}/test_reset_feed_http"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
@@ -89,6 +89,10 @@ run_static_checks() {
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_reset_text.c main/reset_text.c -o "${test_dir}/test_reset_text"
     "${test_dir}/test_reset_text"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain -Itests/vendor/cjson \
+        tests/test_reset_history.c main/reset_history.c main/reset_feed.c \
+        tests/vendor/cjson/cJSON.c -lm -o "${test_dir}/test_reset_history"
+    "${test_dir}/test_reset_history"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Itests/reset_wifi_stubs -Imain \
         tests/test_reset_wifi.c -o "${test_dir}/test_reset_wifi"
     "${test_dir}/test_reset_wifi"
@@ -97,6 +101,7 @@ run_static_checks() {
         tests/test_reset_power.c -o "${test_dir}/test_reset_power"
     "${test_dir}/test_reset_power"
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_blufi_safety_patch.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_reset_idle_integration.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_verify_firmware.py

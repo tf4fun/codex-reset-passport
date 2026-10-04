@@ -242,6 +242,7 @@ int main(void) {
     int gpio = 99;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_OK);
     assert(gpio == 0 && clock_us >= 200000 && bsp_button_deep_sleep_level() == 1);
+    assert(!bsp_button_deep_sleep_had_activity());
     assert(!adc_live && !cal_live && !live_buttons && !s_ready);
     assert(bsp_button_resume_after_deep_sleep_cancel() == ESP_OK);
     assert(s_ready && adc_live && cal_live && live_buttons == BSP_BTN_COUNT);
@@ -272,24 +273,52 @@ int main(void) {
         raw_mv = not_released[i]; clock_us = 0;
         assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_ERR_TIMEOUT);
         assert(clock_us <= 2000000 && s_ready && live_buttons == BSP_BTN_COUNT);
+        assert(bsp_button_deep_sleep_had_activity());
     }
     raw_mv = 3300; fail_read = 1;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_FAIL && s_ready);
+    assert(!bsp_button_deep_sleep_had_activity()); // Read failure is not input.
     fail_read = 0; fail_convert = 1;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_FAIL && s_ready);
     fail_convert = 0; clock_us = 0; adc_dip_at = 90;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_OK);
     assert(clock_us >= 300000); // Stable-window clock reset by the dip.
+    assert(bsp_button_deep_sleep_had_activity());
     assert(bsp_button_resume_after_deep_sleep_cancel() == ESP_OK);
+    assert(bsp_button_deep_sleep_had_activity());
+    assert(bsp_button_init(event_cb, &events) == ESP_OK);
+    assert(bsp_button_deep_sleep_had_activity()); // Init must not erase the wake.
     adc_dip_at = -1; clock_us = 0; gpio_dip_at = 190;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_OK);
     assert(clock_us >= 300000);
+    assert(bsp_button_deep_sleep_had_activity()); // Polling already stopped.
     assert(bsp_button_resume_after_deep_sleep_cancel() == ESP_OK);
+    assert(bsp_button_deep_sleep_had_activity());
+
+    // The latch belongs to one prepare attempt, not to the resource lifetime.
+    gpio_dip_at = -1; clock_us = 0;
+    assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_OK);
+    assert(!bsp_button_deep_sleep_had_activity());
+    assert(bsp_button_resume_after_deep_sleep_cancel() == ESP_OK);
+    assert(!bsp_button_deep_sleep_had_activity());
+
+    // A later pre-terminal GPIO check must not lose a key arriving after the
+    // preparation fence, even if it is released before rollback finishes.
+    assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_OK);
+    assert(!bsp_button_deep_sleep_had_activity());
+    gpio_level = 0;
+    assert(bsp_button_deep_sleep_level() == 0);
+    gpio_level = 1;
+    assert(bsp_button_deep_sleep_level() == 1);
+    assert(bsp_button_deep_sleep_had_activity());
+    assert(bsp_button_resume_after_deep_sleep_cancel() == ESP_OK);
+    assert(bsp_button_deep_sleep_had_activity());
 
     // Digital LOW / configuration errors restore buttons after ADC handoff.
     gpio_dip_at = -1; gpio_level = 0; clock_us = 0;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_ERR_TIMEOUT);
     assert(s_ready && adc_live && live_buttons == BSP_BTN_COUNT);
+    assert(bsp_button_deep_sleep_had_activity()); // Automatic rollback retains it.
     gpio_level = 1; fail_gpio = 1;
     assert(bsp_button_prepare_deep_sleep(2000, &gpio) == ESP_FAIL && s_ready);
     fail_gpio = 0;

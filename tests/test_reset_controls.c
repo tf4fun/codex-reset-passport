@@ -12,15 +12,23 @@ int main(void) {
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_NONE);
     assert(s.page == RESET_UI_HOME && !s.editing); /* Explicit return row. */
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_READING_OPEN && s.page == RESET_UI_READING);
+    assert(reset_controls_admit_reader(&s, RESET_UI_HOME, true));
     assert(reset_controls_handle(&s, RESET_INPUT_UP) == RESET_ACTION_READING_PREVIOUS);
     assert(reset_controls_handle(&s, RESET_INPUT_DOWN) == RESET_ACTION_READING_NEXT);
     assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_NONE && s.page == RESET_UI_HOME);
-    reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_OVERVIEW);
-    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_REFRESH);
+    reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_HISTORY);
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_HISTORY_REFRESH);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_STATS);
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_REFRESH);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_SETTINGS);
     reset_controls_handle(&s, RESET_INPUT_DOWN); assert(s.page == RESET_UI_HOME);
-    const reset_ui_page_t pages[] = {RESET_UI_HOME, RESET_UI_OVERVIEW, RESET_UI_STATS, RESET_UI_READING,
+    /* No record or an unrendered navigation target cannot open a blank/wrong reader. */
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_READING_OPEN);
+    assert(!reset_controls_admit_reader(&s, RESET_UI_HOME, false) && s.page == RESET_UI_HOME);
+    assert(reset_controls_handle(&s, RESET_INPUT_OK) == RESET_ACTION_READING_OPEN);
+    assert(!reset_controls_admit_reader(&s, RESET_UI_STATS, true) && s.page == RESET_UI_HOME);
+    assert(!reset_controls_admit_reader(&s, RESET_UI_HOME, true));
+    const reset_ui_page_t pages[] = {RESET_UI_HOME, RESET_UI_HISTORY, RESET_UI_STATS, RESET_UI_READING,
         RESET_UI_SETTINGS, RESET_UI_TIMEZONE, RESET_UI_SETUP, RESET_UI_CLEAR};
     for (unsigned i = 0; i < sizeof(pages)/sizeof(pages[0]); ++i) {
         s = (reset_controls_t){.page = pages[i], .editing = true};

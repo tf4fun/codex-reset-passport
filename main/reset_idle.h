@@ -37,3 +37,20 @@ bool reset_idle_due(const reset_idle_t *state, uint16_t sleep_minutes,
  * this for reversible admission failure or cancellation, never to enter sleep. */
 void reset_idle_defer_after_cancel_or_failure(reset_idle_t *state,
                                              uint64_t now_ms);
+
+#define RESET_IDLE_DIM_MS UINT64_C(30000)
+#define RESET_IDLE_GRACE_MS UINT64_C(15000)
+typedef struct {
+    bool screen_off;
+    bool grace_active;
+    uint64_t grace_started_ms;
+} reset_idle_screen_t;
+
+/* Called after observe. The grace starts at actual screen-off, not a stale
+ * idle deadline. Blockers cancel admission, failure preserves the dark screen.
+ * Off or real input cancels both immediately. No hardware is touched here. */
+bool reset_idle_screen_tick(reset_idle_screen_t *screen, const reset_idle_t *idle,
+                            uint16_t minutes, uint64_t now_ms, bool activity);
+void reset_idle_screen_failed(reset_idle_screen_t *screen);
+int reset_idle_brightness(const reset_idle_screen_t *screen,
+                         const reset_idle_t *idle, int brightness);

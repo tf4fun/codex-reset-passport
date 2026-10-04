@@ -3,11 +3,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "reset_history.h"
 
 #define RESET_FEED_URL "https://codex-resets.com/api/v1/status"
 #define RESET_FEED_BODY_LIMIT (16U * 1024U)
 #define RESET_FEED_TEXT_MAX_BYTES 256U
 #define RESET_FEED_FORECAST_MAX_BYTES 96U
+#define RESET_FEED_SOURCE_URL_MAX_BYTES 120U
 /* Client policy, not a published upstream rate limit. */
 #define RESET_FEED_FAILURE_BACKOFF_MS UINT64_C(300000)
 #define RESET_FEED_MANUAL_DEBOUNCE_MS UINT64_C(30000)
@@ -33,6 +35,10 @@ typedef struct {
     reset_kind_t kind;
     int64_t announced_at;       /* UTC epoch seconds; announcement, not quota. */
     char id[65];
+    /* Exact, bounded HTTPS source URL on the source-host allowlist. Empty for
+     * observations or missing/unsafe/overlong URLs; never truncate or invent
+     * a destination. QR capacity may impose a smaller limit in the UI. */
+    char source_url[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
     /* Original valid UTF-8, never a translation or executable instruction.
      * Always NUL-terminated at a complete codepoint boundary. At most 256 bytes
      * survive; text_truncated requires an explicit excerpt indicator in the UI.
@@ -53,6 +59,8 @@ typedef struct {
     int64_t scheduled_for;
     bool observed;
     char id[65];
+    /* Same safe source-URL contract as reset_announcement_t. */
+    char source_url[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
     /* Same bounded original-text contract as reset_announcement_t. */
     char text[RESET_FEED_TEXT_MAX_BYTES + 1U];
     bool text_truncated;
@@ -138,11 +146,29 @@ typedef struct {
     uint32_t auto_interval_minutes;
 } reset_feed_snapshot_t;
 
+typedef struct {
+    /* Getter projects the last complete cache into the current UTC window.
+     * Missing days remain UNKNOWN, even when has_data is true. Future days
+     * use reset_history_day_state(), never infer empty from a zero mask. */
+    reset_history_data_t data;
+    bool has_data;
+    bool stale;
+    bool loading;
+    reset_feed_status_t status;
+    reset_feed_error_t error;
+    int http_status;
+    int64_t last_checked_at;
+    uint32_t retry_in_seconds;
+} reset_history_snapshot_t;
+
 /* Pure bounded parser: failure leaves *out unchanged. Requires valid UTF-8
  * JSON; required text must be a string (empty is allowed, null is not).
  * Only validated values and bounded source text survive. Check font coverage;
  * render as plain data with markup/recolor disabled, never as a format string. */
 bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out);
+/* Validate within caller-provided storage, including its terminating NUL.
+ * Empty, unterminated, non-ASCII, non-HTTPS, and non-allowlisted URLs fail. */
+bool reset_feed_source_url_valid(const char *url, size_t capacity);
 bool reset_feed_parse_timestamp(const char *text, int64_t *epoch_seconds);
 bool reset_feed_parse_retry_after(const char *text, uint32_t *seconds);
 /* Accept delta-seconds and all three HTTP-date forms; overflow is clamped to
@@ -168,7 +194,7 @@ void reset_feed_poll_complete(reset_feed_poll_t *poll, uint64_t now_ms,
 
 /* Retain this pointer-free, UTC-based value in RTC_DATA_ATTR storage. Import
  * only after an actual deep-sleep reset; cold boot must ignore RTC contents.
- * Version 3 adds bounded announcement/forecast text; version/size/checksum reject old,
+ * Version 5 adds the small complete history cache; version/size/checksum reject old,
  * corrupt or incompatible snapshots. No secrets,
  * ETag, heap pointer, RTOS handle, or boot-relative clock is retained. */
 typedef struct {
@@ -186,6 +212,11 @@ typedef struct {
     int64_t last_attempt_at;
     int64_t hard_backoff_until;
     int64_t next_auto_at;
+    reset_history_data_t history;
+    uint32_t has_history;
+    uint32_t history_error;
+    int32_t history_http_status;
+    int64_t history_last_checked_at;
 } reset_feed_rtc_state_t;
 
 #ifdef ESP_PLATFORM
@@ -206,6 +237,15 @@ void reset_feed_set_ready(bool wifi_connected, bool time_synchronized);
  * refresh_block explains a rejection. Accepted requests are coalesced. */
 bool reset_feed_request_refresh(void);
 void reset_feed_get_snapshot(reset_feed_snapshot_t *out);
+
+/* Nonblocking, lazy history request on page entry or OK; coalesced and
+ * throttled to six hours after success. Shares the existing worker, transport
+ * readiness, pause, debounce and global failure/Retry-After policy. A true
+ * result means fresh data already exists or a request is pending; it does
+ * not mean network access or successful completion. Pending requests may wait
+ * for Wi-Fi/SNTP/backoff; pause cancels them. */
+bool reset_feed_request_history(void);
+void reset_feed_get_history_snapshot(reset_history_snapshot_t *out);
 
 /* Configuration is applied immediately; flash persistence belongs to caller. */
 bool reset_feed_set_auto_interval(uint32_t minutes);

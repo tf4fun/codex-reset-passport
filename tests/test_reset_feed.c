@@ -68,6 +68,7 @@ static void test_valid_feed(void)
     assert(data.latest.present && data.latest.kind == RESET_KIND_REGULAR);
     assert(!data.latest.observed);
     assert(strcmp(data.latest.id, "2106131810921136451") == 0);
+    assert(strcmp(data.latest.source_url, "https://x.com/thsottiaux/status/2106131810921136451") == 0);
     assert(strcmp(data.latest.text, "Reset all propagated. Enjoy. https://t.co/GaVJhbptR0") == 0);
     assert(!data.latest.text_truncated && !data.latest.text_has_non_ascii);
     assert(data.latest.announced_at == INT64_C(1790975928));
@@ -89,6 +90,7 @@ static void test_valid_feed(void)
     cJSON_ReplaceItemInObjectCaseSensitive(body, "active_watch", cJSON_Parse(watch));
     assert(parse_tree(root, &data));
     assert(data.latest.observed && data.latest.kind == RESET_KIND_BANKED);
+    assert(data.latest.source_url[0] == '\0' && data.scheduled.source_url[0] == '\0');
     assert(data.scheduled.present && data.scheduled.has_time);
     assert(data.scheduled.observed && strcmp(data.scheduled.id, "scheduled-123") == 0);
     assert(strcmp(data.scheduled.text, "This is still awaiting execution evidence.") == 0);
@@ -225,6 +227,106 @@ static void test_announcement_text(void)
     assert(data.scheduled.announced_at > data.latest.announced_at);
     assert(strcmp(data.latest.text, "Reset all propagated. Enjoy. https://t.co/GaVJhbptR0") == 0);
     assert(strcmp(data.scheduled.text, "This is still awaiting execution evidence.") == 0);
+    cJSON_Delete(root);
+}
+
+static void test_source_urls(void)
+{
+    const char *valid[] = {
+        "https://x.com/thsottiaux/status/123",
+        "https://www.x.com/thsottiaux/status/456?s=20&t=a%2Fb#source",
+        "https://twitter.com/thsottiaux/status/789",
+        "https://www.twitter.com/thsottiaux/status/012",
+        "https://codex-resets.com/", "https://x.com", "https://x.com?source=1",
+        "https://codex-resets.com#announcements",
+    };
+    const char *invalid[] = {
+        "", "https://", "http://x.com/123", "HTTPS://x.com/123", "//x.com/123",
+        "https://evil.example/123", "https://x.com.evil.example/123",
+        "https://evilx.com/123", "https://sub.x.com/123", "https://www.codex-resets.com/",
+        "https://x.com./123", "https://X.com/123", "https://x.com:443/123",
+        "https://x.com:/123", "https://user@x.com/123", "https://x.com@evil.example/123",
+        "https://user:secret@x.com/123", "https://%78.com/123", "https://x%2ecom/123",
+        "https://x.com\\@evil.example/123", "https://x.com/abc\\def",
+        " https://x.com/123", "https://x.com/has space", "https://x.com/123\n",
+        "https://x.com/123\r", "https://x.com/123\t", "https://x.com/123\x01",
+        "https://x.com/123\x7f", "https://x.com/\xe9\x87\x8d\xe7\xbd\xae",
+        "https://x.com/\xf0\x9f\x98\x80", "https://\xd1\x85.com/123",
+    };
+    assert(!reset_feed_source_url_valid(NULL, 123));
+    assert(!reset_feed_source_url_valid(valid[0], 0));
+    assert(!reset_feed_source_url_valid(valid[0], strlen(valid[0])));
+    assert(reset_feed_source_url_valid(valid[0], strlen(valid[0]) + 1));
+    char unterminated[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
+    memset(unterminated, 'a', sizeof(unterminated));
+    assert(!reset_feed_source_url_valid(unterminated, sizeof(unterminated)));
+
+    const char *records[] = {"latest_reset", "scheduled_reset"};
+    for (size_t r = 0; r < sizeof(records) / sizeof(records[0]); ++r) {
+        cJSON *root = cJSON_Parse(fixture);
+        cJSON *body = item(root, "data");
+        cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", cJSON_Parse(scheduled));
+        cJSON *record = item(body, records[r]);
+        cJSON_ReplaceItemInObjectCaseSensitive(record, "source",
+            cJSON_Parse("{\"type\":\"x_post\",\"author\":\"thsottiaux\",\"url\":null}"));
+        cJSON *source = item(record, "source");
+        reset_feed_data_t data;
+        for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i) {
+            assert(reset_feed_source_url_valid(valid[i], strlen(valid[i]) + 1));
+            cJSON_ReplaceItemInObjectCaseSensitive(source, "url", cJSON_CreateString(valid[i]));
+            assert(parse_tree(root, &data));
+            assert(strcmp(r ? data.scheduled.source_url : data.latest.source_url, valid[i]) == 0);
+        }
+        for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+            assert(!reset_feed_source_url_valid(invalid[i], strlen(invalid[i]) + 1));
+            cJSON_ReplaceItemInObjectCaseSensitive(source, "url", cJSON_CreateString(invalid[i]));
+            assert(parse_tree(root, &data));
+            assert((r ? data.scheduled.source_url : data.latest.source_url)[0] == '\0');
+            assert(r ? data.scheduled.present : data.latest.present);
+            assert(!(r ? data.scheduled.observed : data.latest.observed));
+        }
+        char long_url[4097];
+        const size_t lengths[] = {RESET_FEED_SOURCE_URL_MAX_BYTES - 1U,
+                                 RESET_FEED_SOURCE_URL_MAX_BYTES,
+                                 RESET_FEED_SOURCE_URL_MAX_BYTES + 1U,
+                                 sizeof(long_url) - 1U};
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+            memset(long_url, 'a', lengths[i]);
+            memcpy(long_url, "https://x.com/", strlen("https://x.com/"));
+            long_url[lengths[i]] = '\0';
+            bool fits = lengths[i] <= RESET_FEED_SOURCE_URL_MAX_BYTES;
+            assert(reset_feed_source_url_valid(long_url, lengths[i] + 1) == fits);
+            cJSON_ReplaceItemInObjectCaseSensitive(source, "url", cJSON_CreateString(long_url));
+            assert(parse_tree(root, &data));
+            const char *retained = r ? data.scheduled.source_url : data.latest.source_url;
+            assert(strcmp(retained, fits ? long_url : "") == 0); /* Never truncate. */
+        }
+        for (int kind = 0; kind < 6; ++kind) {
+            if (kind == 5) cJSON_DeleteItemFromObjectCaseSensitive(source, "url");
+            else cJSON_ReplaceItemInObjectCaseSensitive(source, "url",
+                kind == 0 ? cJSON_CreateNull() : kind == 1 ? cJSON_CreateNumber(7) :
+                kind == 2 ? cJSON_CreateBool(true) : kind == 3 ? cJSON_CreateArray() : cJSON_CreateObject());
+            assert(parse_tree(root, &data));
+            assert((r ? data.scheduled.source_url : data.latest.source_url)[0] == '\0');
+        }
+        cJSON_AddStringToObject(source, "url", valid[0]);
+        cJSON_ReplaceItemInObjectCaseSensitive(source, "type", cJSON_CreateString("observed"));
+        assert(parse_tree(root, &data));
+        assert((r ? data.scheduled.source_url : data.latest.source_url)[0] == '\0');
+        assert(r ? data.scheduled.observed : data.latest.observed);
+        cJSON_Delete(root);
+    }
+    cJSON *root = cJSON_Parse(fixture);
+    cJSON *body = item(root, "data");
+    cJSON *next = cJSON_Parse(scheduled);
+    cJSON_ReplaceItemInObjectCaseSensitive(next, "source",
+        cJSON_Parse("{\"type\":\"x_post\",\"author\":\"thsottiaux\","
+                    "\"url\":\"https://twitter.com/thsottiaux/status/scheduled-456\"}"));
+    cJSON_ReplaceItemInObjectCaseSensitive(body, "scheduled_reset", next);
+    reset_feed_data_t data;
+    assert(parse_tree(root, &data));
+    assert(strcmp(data.latest.source_url, "https://x.com/thsottiaux/status/2106131810921136451") == 0);
+    assert(strcmp(data.scheduled.source_url, "https://twitter.com/thsottiaux/status/scheduled-456") == 0);
     cJSON_Delete(root);
 }
 
@@ -614,6 +716,7 @@ int main(void)
 {
     test_valid_feed();
     test_announcement_text();
+    test_source_urls();
     test_forecast_window();
     test_timestamps();
     test_stats();

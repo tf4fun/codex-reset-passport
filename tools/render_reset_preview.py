@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import hashlib
+from datetime import datetime
 import json
 import re
 import shutil
@@ -52,6 +53,8 @@ def hold_artifacts(output: Path, scenarios: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--feed", type=Path, help="Optional captured API JSON; parsed by firmware parser")
+    parser.add_argument("--history-feed", type=Path, help="Optional single-page captured history JSON; parsed by firmware parser")
+    parser.add_argument("--history-weeks", type=int, choices=(6, 8), default=8, help="Compile query/cache/UI consistently for 6 or 8 weeks")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/reset-ui-preview")
     parser.add_argument("--output", type=Path, default=ROOT / "build/reset-ui-preview/screens")
     args = parser.parse_args()
@@ -61,11 +64,16 @@ def main() -> None:
     build, output = args.build_dir.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     subprocess.run([cmake, "-S", str(ROOT / "tools/reset_ui_preview"), "-B", str(build),
-                    "-DCMAKE_BUILD_TYPE=Release"], check=True)
+                    "-DCMAKE_BUILD_TYPE=Release", f"-DRESET_HISTORY_PREVIEW_WEEKS={args.history_weeks}"], check=True)
     subprocess.run([cmake, "--build", str(build), "--parallel", "8"], check=True)
     command = [str(build / "reset_ui_preview"), str(output)]
-    if args.feed:
-        command.append(str(args.feed.resolve()))
+    history_capture = json.loads(args.history_feed.read_text(encoding="utf-8")) if args.history_feed else {}
+    if args.feed or args.history_feed:
+        command.append(str(args.feed.resolve()) if args.feed else "-")
+    if args.history_feed:
+        generated = history_capture.get("meta", {}).get("generated_at")
+        history_epoch = int(datetime.fromisoformat(generated.replace("Z", "+00:00")).timestamp())
+        command.extend([str(args.history_feed.resolve()), str(history_epoch)])
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end="")
     (output / "audit.txt").write_text(result.stdout, encoding="utf-8")
@@ -99,7 +107,10 @@ def main() -> None:
         "rounding": "Actual BSP rounded-row geometry, black outside visible span",
         "radius": int(re.search(r"#define\s+BSP_LVGL_SCREEN_RADIUS\s+(\d+)",
                       (ROOT / "components/bsp/include/bsp_display.h").read_text()).group(1)), "hardware_validation": False,
-        "scenarios": "Synthetic unless named 00-captured-feed",
+        "scenarios": "Synthetic unless named 00-captured-*",
+        "captured_history_sha256": hashlib.sha256(args.history_feed.read_bytes()).hexdigest() if args.history_feed else None,
+        "captured_history_generated_at": history_capture.get("meta", {}).get("generated_at"),
+        "captured_history_reference": "Response generated_at is the UI reference clock; actual bounded parser verifies one complete captured history page",
         "captured_feed_sha256": hashlib.sha256(args.feed.read_bytes()).hexdigest() if args.feed else None,
         "captured_feed_generated_at": captured.get("meta", {}).get("generated_at"),
         "captured_latest_announced_at": (captured.get("data", {}).get("latest_reset") or {}).get("announced_at"),
@@ -111,14 +122,23 @@ def main() -> None:
             "wrapping": "Actual LVGL glyph advance/kerning; whitespace breaks then UTF-8 codepoint breaks for URLs/words",
             "unsupported_glyphs": "Visible ? replacement with an explicit warning",
             "input_byte_or_page_limit": "Reader ellipsis and conspicuous retained-excerpt notice",
-            "home_presentation": "Latest announcement relative time, exact local date, small type/status; no original-text summary",
+            "home_presentation": "Future card always above latest card; scheduled future expands, otherwise latest expands; no announcement body or historical-average forecast",
             "translation": "None; original API text only",
-            "selection": "Newer announced_at of latest_reset/scheduled_reset; watch never ranked as announcement",
+            "selection": "Scheduled record wins by presence; otherwise latest; reader/source/date/zone are frozen at entry; watch only a labelled secondary prediction",
             "reader_stress": "500 page/truncation changes after identical warm-up; exact live allocation equality",
             "fixture_coverage": ["256-byte unbroken W", "unbroken URL", "emoji and missing CJK", "CR/LF/TAB", "source truncation", "all eight newline-heavy pages", "watch-only", "expired forecast", "forecast truncation/replacement", "Chinese relative age extremes"]
         },
+        "history_calendar": {
+            "weeks": args.history_weeks,
+            "compile_contract": "One RESET_HISTORY_WEEKS value drives query/cache/presenter/UI",
+            "layout": "Week columns with Monday-to-Sunday rows, UTC month labels",
+            "states": "regular orange #FF5C29, banked peach #FFAD7C, split mixed, warm-grey known empty, outlined unknown, pale future",
+            "coverage": "Only validated complete pagination marks known; unknown is never drawn as empty",
+            "rendering": "One custom-draw object for all bounded cells; one multiline weekday label retains overlay headroom",
+            "stress": "Every cell BOTH, history-page 500 hold frames and 100 cancel cycles, exact warmed allocation equality; independent centre-pixel probes",
+        },
         "wifi_diagnostics": {
-            "scope": "Setup/settings only; frozen HOME and seven-line reader unchanged",
+            "scope": "Numeric diagnostics only in setup/settings",
             "fields": ["initialized", "connecting", "attempts out of 5", "last runtime error", "last disconnect reason", "independent persistence error"],
             "numeric_labels": "E: error code; D: last disconnect reason; no SSID/password",
             "save_failure": "Connected is independent of credential persistence; active provisioning countdown remains visible with save failure",
@@ -138,8 +158,9 @@ def main() -> None:
             "scenarios": scenarios
         },
         "source_hashes": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                          for p in (ROOT / "main/reset_ui.c", ROOT / "main/reset_ui.h",
-                                    ROOT / "main/reset_presenter.c",
+                          for p in (ROOT / "main/reset_ui.c", ROOT / "main/reset_ui.h", ROOT / "main/reset_ui_layout.h",
+                                    ROOT / "main/reset_presenter.c", ROOT / "main/reset_presenter.h",
+                                    ROOT / "main/reset_history.c", ROOT / "main/reset_history.h",
                                     ROOT / "main/reset_text.c", ROOT / "main/reset_text.h",
                                     ROOT / "main/reset_hold.c", ROOT / "main/reset_hold.h",
                                     ROOT / "tools/reset_ui_preview/preview.c",

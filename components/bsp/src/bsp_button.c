@@ -23,6 +23,7 @@ static void           *s_user;
 static volatile bool   s_ready;
 static bool s_sleep_handoff;
 static bool s_sleep_prepared;
+static bool s_sleep_had_activity;
 static bsp_btn_cb_t s_saved_cb;
 static void *s_saved_user;
 static int s_wake_gpio = -1;
@@ -334,7 +335,10 @@ static esp_err_t wait_released(bool digital, int64_t deadline_us) {
             released = mv >= BSP_BTN_RELEASE_MIN_MV &&
                        mv <= BSP_BTN_RELEASE_MAX_MV;
         }
-        if (!released) high_since = -1;
+        if (!released) {
+            s_sleep_had_activity = true;
+            high_since = -1;
+        }
         else if (high_since < 0) high_since = now;
         else if (now - high_since >= BUTTON_RELEASE_STABLE_US) return ESP_OK;
         vTaskDelay(delay_ticks(BUTTON_RELEASE_POLL_MS));
@@ -404,6 +408,7 @@ esp_err_t bsp_button_resume_after_deep_sleep_cancel(void) {
 }
 
 esp_err_t bsp_button_prepare_deep_sleep(uint32_t timeout_ms, int *wake_gpio) {
+    s_sleep_had_activity = false;
     if (!wake_gpio || timeout_ms < 250) return ESP_ERR_INVALID_ARG;
     *wake_gpio = -1;
     if (!s_ready || s_sleep_handoff) return ESP_ERR_INVALID_STATE;
@@ -448,5 +453,11 @@ esp_err_t bsp_button_prepare_deep_sleep(uint32_t timeout_ms, int *wake_gpio) {
 }
 
 int bsp_button_deep_sleep_level(void) {
-    return s_sleep_prepared ? gpio_get_level(s_wake_gpio) : -1;
+    int level = s_sleep_prepared ? gpio_get_level(s_wake_gpio) : -1;
+    if (level == 0) s_sleep_had_activity = true;
+    return level;
+}
+
+bool bsp_button_deep_sleep_had_activity(void) {
+    return s_sleep_had_activity;
 }

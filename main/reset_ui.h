@@ -1,8 +1,9 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "reset_feed.h"
 typedef enum {
-    RESET_UI_HOME = 0, RESET_UI_OVERVIEW = 1, RESET_UI_STATS = 2, RESET_UI_SETTINGS = 3,
+    RESET_UI_HOME = 0, RESET_UI_HISTORY = 1, RESET_UI_STATS = 2, RESET_UI_SETTINGS = 3,
     RESET_UI_READING,
     RESET_UI_SETUP, RESET_UI_CLEAR, RESET_UI_TIMEZONE,
     RESET_UI_SLEEP_WAIT
@@ -16,14 +17,24 @@ typedef struct {
     char announcement_type[48];
     char announcement_age[48];
     char announcement_date[48];
+    char announcement_source_url[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
+    bool announcement_source_original;
     bool announcement_truncated;
+    bool reading_available; /* A relevant record is selected on HOME/OVERVIEW, or frozen in READING. */
     bool next_truncated;
     bool timing_is_forecast;
+    bool primary_scheduled;
+    bool latest_available;
+    int16_t forecast_confidence;
     uint8_t reading_page;
     char date[48];
     char zone[32];
     char next_title[48];
-    char next_body[128];
+    char next_body[128]; /* Raw prediction window, never an inferred timestamp. */
+    char next_time[32];
+    char next_date[32];
+    char next_status[64];
+    bool next_has_time;
     char freshness[64];
     char detail_type[48];
     char detail_source[48];
@@ -36,6 +47,10 @@ typedef struct {
     char stats_elapsed[24];
     char settings_values[7][32];
     char sleep_progress[64];
+    uint8_t history_cells[RESET_HISTORY_DAYS]; /* reset_history_day_state_t, never counts. */
+    char history_range[48];
+    char history_months[RESET_HISTORY_WEEKS][12];
+    char history_note[48];
     uint8_t selected_setting;
     bool warning;
     bool connected;

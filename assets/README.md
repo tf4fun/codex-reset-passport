@@ -109,12 +109,13 @@ known-missing U+9F98 is rejected, audits the active font on each rendered label,
 and rejects clipped labels. Device rendering and internal heap remain separate
 hardware checks; neither this preview nor compilation establishes them.
 
-The v2.3 announcement/reader regeneration covers 123 fixed strings and 324
+The v2.4 dual-card/history regeneration covers 145 fixed strings and 331
 codepoints in both 12/16px assets. The 24px font contains only 25 codepoints
-needed by the relative-age formatter. Source subset SHA-256:
-`fe18e600a2d7fa2373387f8fe32e70f088bcfc06021f94b416636544503f8cf4`.
-The host's font objects contain 23734/36322/5056 bytes of text/read-only data
-for 12/16/24px respectively (host object measurements, not final firmware sizes).
-The actual-render tool emits the three production-state-machine hold GIFs,
-original-text and all-page limit fixtures, and an unlabeled fill-stage strip;
-see [the preview details](../tools/reset_ui_preview/README.md).
+needed by the relative-age formatter; its inventory is extracted only from
+that formatter, not adjacent helpers. Source subset SHA-256:
+`872d6fd3cd056d769d343b9712f61fbf8ffdd9e05ad564b15ad83d56ab9f4783`.
+The host font objects contain 24178/37099/5056 bytes of text/read-only data
+for 12/16/24px (host measurements, not final firmware sizes).
+The actual renderer covers source QR, frozen-reader selection, the dual-card
+HOME, real captured 8-week history, all-mixed/unknown/future cells, and existing
+hold GIFs. See [the preview details](../tools/reset_ui_preview/README.md).

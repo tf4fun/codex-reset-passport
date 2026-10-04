@@ -23,7 +23,8 @@ FONT_SIZES = (12, 16)
 def hero_inventory() -> str:
     """Derive the tiny 24px font from the relative-age formatter, not guesses."""
     source = (ROOT / "main/reset_presenter.c").read_text(encoding="utf-8")
-    source = source[source.index("static void relative("):source.index("#define SET")]
+    start = source.index("static void relative(")
+    source = source[start:source.index("\n}\n", start) + 3]
     chars = set("0123456789-")
     for token in re.findall(r'"(?:\\.|[^"\\])*"', source):
         chars.update(re.sub(r"%lld", "", ast.literal_eval(token)))

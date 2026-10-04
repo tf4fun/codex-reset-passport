@@ -6,6 +6,7 @@
 #include <string.h>
 #include "lvgl.h"
 #include "reset_ui.h"
+#include "reset_ui_layout.h"
 #include "reset_text.h"
 #include "reset_hold.h"
 #include "reset_presenter.h"
@@ -23,6 +24,13 @@ static unsigned label_count;
 static unsigned missing_count;
 static unsigned clipped_count;
 static unsigned unexpected_deletes;
+static unsigned history_cell_checks, history_cell_failures;
+static unsigned history_margin_checks, history_margin_failures;
+static unsigned home_palette_checks, home_palette_failures;
+static unsigned time_center_checks, time_center_failures;
+_Static_assert(RESET_UI_HISTORY_COLUMN_PITCH - RESET_UI_HISTORY_CELL_SIZE >= 6, "history column breathing room");
+_Static_assert(RESET_UI_HISTORY_ROW_PITCH - RESET_UI_HISTORY_CELL_SIZE >= 6, "history row breathing room");
+static unsigned qr_checks, qr_failures;
 
 static void flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels) {
     const uint16_t *source = (const uint16_t *)pixels;
@@ -157,6 +165,14 @@ static lv_obj_t *find_arc(lv_obj_t *obj) {
     return NULL;
 }
 
+static lv_obj_t *find_qr(lv_obj_t *obj) {
+    if (lv_obj_check_type(obj, &lv_qrcode_class)) return obj;
+    for (uint32_t i = 0; i < lv_obj_get_child_count(obj); ++i) {
+        lv_obj_t *found = find_qr(lv_obj_get_child(obj, i));
+        if (found) return found;
+    }
+    return NULL;
+}
 static void unexpected_delete(lv_event_t *event) {
     (void)event;
     ++unexpected_deletes;
@@ -303,6 +319,91 @@ static void write_ppm(const char *dir, const char *name) {
     printf("Rendered %s\n", path);
 }
 
+static uint16_t rgb565(uint32_t rgb) {
+    return (uint16_t)((((rgb >> 19) & 31U) << 11) | (((rgb >> 10) & 63U) << 5) | ((rgb >> 3) & 31U));
+}
+static void audit_history_pixels(const reset_ui_model_t *model) {
+    for (unsigned i = 0; i < RESET_HISTORY_DAYS; ++i) {
+        int x = RESET_UI_HISTORY_GRID_X + (i / 7) * RESET_UI_HISTORY_COLUMN_PITCH;
+        int y = RESET_UI_HISTORY_GRID_Y + (i % 7) * RESET_UI_HISTORY_ROW_PITCH;
+        uint8_t state = model->history_cells[i];
+        uint32_t left = state == RESET_HISTORY_DAY_REGULAR || state == RESET_HISTORY_DAY_BOTH ? 0xFF5C29 :
+                        state == RESET_HISTORY_DAY_BANKED ? 0xFFAD7C :
+                        state == RESET_HISTORY_DAY_EMPTY ? 0xDDD3C1 :
+                        state == RESET_HISTORY_DAY_FUTURE ? 0xF5EEDC : 0xFFFDF7;
+        uint32_t right = state == RESET_HISTORY_DAY_BOTH ? 0xFFAD7C : left;
+        history_cell_checks += 2;
+        if (framebuffer[(y + RESET_UI_HISTORY_CELL_SIZE / 2) * WIDTH + x + RESET_UI_HISTORY_CELL_SIZE / 4] != rgb565(left) ||
+            framebuffer[(y + RESET_UI_HISTORY_CELL_SIZE / 2) * WIDTH + x + RESET_UI_HISTORY_CELL_SIZE * 3 / 4] != rgb565(right)) {
+            ++history_cell_failures;
+            fprintf(stderr, "History day %u state %u has incorrect rendered colours\n", i, state);
+        }
+        if (i / 7 + 1 < RESET_HISTORY_WEEKS) {
+            ++history_cell_checks;
+            int gap_x = x + RESET_UI_HISTORY_CELL_SIZE + (RESET_UI_HISTORY_COLUMN_PITCH - RESET_UI_HISTORY_CELL_SIZE) / 2;
+            if (framebuffer[(y + RESET_UI_HISTORY_CELL_SIZE / 2) * WIDTH + gap_x] != rgb565(0xFFFDF7)) ++history_cell_failures;
+        }
+        if (i % 7 < 6) {
+            ++history_cell_checks;
+            int gap_y = y + RESET_UI_HISTORY_CELL_SIZE + (RESET_UI_HISTORY_ROW_PITCH - RESET_UI_HISTORY_CELL_SIZE) / 2;
+            if (framebuffer[gap_y * WIDTH + x + RESET_UI_HISTORY_CELL_SIZE / 2] != rgb565(0xFFFDF7)) ++history_cell_failures;
+        }
+    }
+}
+static void audit_history_margins(void) {
+    int first = WIDTH, last = -1;
+    /* Exclude only the frame's curved outline; include actual weekday ink,
+     * month ink and every cell, so this measures the whole visible table. */
+    for (int y = RESET_UI_HISTORY_MONTH_Y;
+         y < RESET_UI_HISTORY_GRID_Y + 6 * RESET_UI_HISTORY_ROW_PITCH + RESET_UI_HISTORY_CELL_SIZE; ++y)
+        for (int x = RESET_UI_HISTORY_PANEL_X + 4;
+             x < RESET_UI_HISTORY_PANEL_X + RESET_UI_HISTORY_PANEL_W - 4; ++x)
+            if (framebuffer[y * WIDTH + x] != rgb565(0xFFFDF7)) {
+                if (x < first) first = x;
+                if (x > last) last = x;
+            }
+    int left_gap = first - (RESET_UI_HISTORY_PANEL_X + 1);
+    int right_gap = RESET_UI_HISTORY_PANEL_X + RESET_UI_HISTORY_PANEL_W - 2 - last;
+    ++history_margin_checks;
+    if (last < first || left_gap < 7 || right_gap < 7 || abs(left_gap - right_gap) > 1) {
+        ++history_margin_failures;
+        fprintf(stderr, "History table margins unbalanced: ink=%d..%d left=%d right=%d\n", first, last, left_gap, right_gap);
+    }
+    printf("History actual visible table: x=%d..%d, left=%dpx right=%dpx\n", first, last, left_gap, right_gap);
+}
+static void audit_home_palette(const reset_ui_model_t *model) {
+    const unsigned points[3][2] = {{25, model->primary_scheduled ? 100U : 115U},
+                                  {25, model->primary_scheduled ? 241U : 200U},
+                                  {195, model->primary_scheduled ? 263U : 201U}};
+    const uint32_t expected[] = {0xA5DCFF, 0xFFFDF7, 0xFFD84D};
+    for (unsigned i = 0; i < 3; ++i) {
+        ++home_palette_checks;
+        if (framebuffer[points[i][1] * WIDTH + points[i][0]] != rgb565(expected[i])) {
+            ++home_palette_failures;
+            fprintf(stderr, "HOME semantic palette mismatch: scheduled=%u sample=%u\n", model->primary_scheduled, i);
+        }
+    }
+}
+/* Test the actual rendered glyph pixels, independently of LVGL's line box.
+ * The interior x-span excludes rounded outlines while including all supported
+ * fixed-width time strings, including 99-day and 9999-day relative values. */
+static void audit_time_ink(int panel_y, int panel_h, uint32_t background, const char *value) {
+    int first = HEIGHT, last = -1;
+    uint16_t bg = rgb565(background);
+    for (int y = panel_y + 1; y < panel_y + panel_h - 1; ++y)
+        for (int x = 37; x <= 201; ++x)
+            if (framebuffer[y * WIDTH + x] != bg) {
+                if (y < first) first = y;
+                if (y > last) last = y;
+            }
+    ++time_center_checks;
+    int above = first - (panel_y + 1);
+    int below = panel_y + panel_h - 2 - last;
+    if (last < first || above < 1 || below < 1 || abs(above - below) > 1) {
+        ++time_center_failures;
+        fprintf(stderr, "Time ink not vertically centred: %s topgap=%d bottomgap=%d\n", value, above, below);
+    }
+}
 static void render(const char *dir, const char *name, const reset_ui_model_t *model) {
     audit_page = model->page;
     reset_ui_update(model);
@@ -316,6 +417,22 @@ static void render(const char *dir, const char *name, const reset_ui_model_t *mo
            current_memory.free_size, current_memory.free_biggest_size,
            object_count(lv_screen_active()));
     lv_refr_now(NULL);
+    if (model->page == RESET_UI_HISTORY) { audit_history_pixels(model); audit_history_margins(); }
+    if (model->page == RESET_UI_HOME && !model->hold_visible) {
+        audit_home_palette(model);
+        if (model->primary_scheduled) {
+            audit_time_ink(113, 49, 0xD6EEFF, model->next_time);
+            audit_time_ink(251, 25, 0xFFD84D, model->latest_available ? model->hero : "暂无记录");
+        } else audit_time_ink(180, 49, 0xFFD84D, model->latest_available ? model->hero : "暂无记录");
+    }
+    if (model->page == RESET_UI_READING && model->reading_available &&
+        model->reading_page >= reset_ui_reading_page_count() - 1U) {
+        ++qr_checks;
+        if (!find_qr(lv_screen_active())) {
+            ++qr_failures;
+            fprintf(stderr, "QR source page did not create a real QR object: %s\n", name);
+        }
+    }
     write_ppm(dir, name);
 }
 
@@ -332,6 +449,7 @@ static bool render_hold_scenario(const char *dir, FILE *trace, const char *name,
     reset_presenter_state_t state = *base;
     state.page = RESET_UI_HOME;
     reset_ui_model_t model;
+    reset_reader_snapshot_t reader = {0};
     bool valid = true;
     unsigned tap_count = 0, cancel_count = 0, sleep_count = 0, frame = 0;
     fprintf(trace, "{\"name\":\"%s\",\"pressed_ms\":%u,\"released_ms\":%u,\"frames\":[",
@@ -344,7 +462,10 @@ static bool render_hold_scenario(const char *dir, FILE *trace, const char *name,
         reset_hold_event_t event = reset_hold_tick(&hold, now, now >= released_ms);
         bool tapped = released == RESET_HOLD_TAP || event == RESET_HOLD_TAP;
         tap_count += tapped;
-        if (tapped) state.page = RESET_UI_READING; /* Ordinary HOME short-confirm action. */
+        if (tapped && reset_presenter_capture_reader(&model, &reader)) {
+            state.reader_snapshot = &reader;
+            state.page = RESET_UI_READING;
+        }
         cancel_count += released == RESET_HOLD_CANCEL || event == RESET_HOLD_CANCEL;
         if (event == RESET_HOLD_SLEEP) {
             ++sleep_count;
@@ -395,7 +516,7 @@ static bool render_hold_scenario(const char *dir, FILE *trace, const char *name,
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) { fprintf(stderr, "Usage: %s OUTPUT_DIRECTORY [FEED_JSON]\n", argv[0]); return 2; }
+    if (argc < 2 || argc > 5 || argc == 4) { fprintf(stderr, "Usage: %s OUTPUT_DIRECTORY [FEED_JSON|-] [HISTORY_JSON HISTORY_EPOCH]\n", argv[0]); return 2; }
     lv_init();
     lv_display_t *display = lv_display_create(WIDTH, HEIGHT);
     if (!display) return 2;
@@ -434,9 +555,14 @@ int main(int argc, char **argv) {
     feed.data.stats.has_days_since_last = true;
     feed.data.stats.days_since_last = 2.4;
     reset_ui_model_t model;
+    reset_reader_snapshot_t reader = {0};
+#define CAPTURE_READER() do { reset_ui_page_t before = state.page; \
+    state.page = RESET_UI_HOME; reset_presenter_build(&feed, &state, &model); \
+    if (!reset_presenter_capture_reader(&model, &reader)) { fprintf(stderr, "Fixture has no primary reader record\n"); return 2; } \
+    state.reader_snapshot = &reader; state.page = before; } while (0)
 #define SHOW(name) do { reset_presenter_build(&feed, &state, &model); \
                        render(argv[1], (name), &model); } while (0)
-    if (argc == 3) {
+    if (argc >= 3 && strcmp(argv[2], "-")) {
         FILE *file = fopen(argv[2], "rb");
         if (!file) { perror(argv[2]); return 2; }
         char json[RESET_FEED_BODY_LIMIT + 1];
@@ -458,25 +584,145 @@ int main(int argc, char **argv) {
         captured_state.battery = -1;
         reset_presenter_build(&captured, &captured_state, &model);
         render(argv[1], "00-captured-feed", &model);
+        reset_reader_snapshot_t captured_reader;
+        bool captured_available = reset_presenter_capture_reader(&model, &captured_reader);
+        captured_state.reader_snapshot = &captured_reader;
         captured_state.page = RESET_UI_READING;
-        for (unsigned page = 0; page < reset_ui_reading_page_count(); ++page) {
+        for (unsigned page = 0; captured_available && page < reset_ui_reading_page_count(); ++page) {
             captured_state.reading_page = page;
             reset_presenter_build(&captured, &captured_state, &model);
             char name[64]; snprintf(name, sizeof(name), "00-captured-reader-%u", page + 1);
             render(argv[1], name, &model);
         }
-        captured_state.page = RESET_UI_OVERVIEW;
-        reset_presenter_build(&captured, &captured_state, &model);
-        render(argv[1], "00-captured-overview", &model);
+    }
+    if (argc == 5) {
+        FILE *file = fopen(argv[3], "rb");
+        if (!file) { perror(argv[3]); return 2; }
+        char json[RESET_FEED_BODY_LIMIT + 1];
+        size_t length = fread(json, 1, sizeof(json), file);
+        bool io_error = ferror(file); fclose(file);
+        static reset_history_accumulator_t captured_history_accumulator;
+        int64_t history_at = strtoll(argv[4], NULL, 10);
+        if (io_error || length > RESET_FEED_BODY_LIMIT ||
+            !reset_history_begin(&captured_history_accumulator, history_at) ||
+            !reset_history_parse_page(&captured_history_accumulator, json, length) ||
+            !captured_history_accumulator.complete) {
+            fprintf(stderr, "History capture must be one complete bounded parser cycle\n"); return 2;
+        }
+        reset_history_snapshot_t captured_history = {.has_data = true, .status = RESET_FEED_CURRENT,
+            .data = captured_history_accumulator.data, .last_checked_at = history_at};
+        reset_presenter_state_t captured_state = state;
+        captured_state.page = RESET_UI_HISTORY; captured_state.now = history_at;
+        captured_state.history = &captured_history; captured_state.battery = -1;
+        reset_presenter_build(&feed, &captured_state, &model);
+        render(argv[1], "00-captured-history", &model);
+        printf("Captured history: %u records in %u page(s), %u UTC weeks; complete\n",
+               captured_history_accumulator.item_count, captured_history_accumulator.pages, RESET_HISTORY_WEEKS);
     }
     SHOW("01-home-current");
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
     SHOW("01b-announcement-reading");
     state.reading_page = 1;
     SHOW("01c-announcement-reading-end");
+    state.reading_page = 8;
+    SHOW("46-source-fallback");
+    /* Synthetic max-bound address validates sizing, never presented as a real post. */
+    snprintf(feed.data.latest.source_url, sizeof(feed.data.latest.source_url), "https://x.com/test/status/");
+    memset(feed.data.latest.source_url + strlen(feed.data.latest.source_url), '7',
+           RESET_FEED_SOURCE_URL_MAX_BYTES - strlen(feed.data.latest.source_url));
+    feed.data.latest.source_url[RESET_FEED_SOURCE_URL_MAX_BYTES] = '\0';
+    CAPTURE_READER();
+    SHOW("47-source-max-bound");
+    bool qr_stress_ok = stress_hold(&model) && stress_cancel(&model);
+    lv_mem_monitor_t qr_before = {0}, qr_after = {0};
     state.reading_page = 0;
-    state.page = RESET_UI_OVERVIEW;
-    SHOW("02-reset-overview");
+    reset_presenter_build(&feed, &state, &model); reset_ui_update(&model); lv_refr_now(NULL);
+    state.reading_page = 8;
+    reset_presenter_build(&feed, &state, &model); reset_ui_update(&model); lv_refr_now(NULL);
+    lv_mem_monitor(&qr_before);
+    for (unsigned cycle = 0; cycle < 100; ++cycle) {
+        state.reading_page = 0;
+        reset_presenter_build(&feed, &state, &model); reset_ui_update(&model); lv_refr_now(NULL);
+        state.reading_page = 8;
+        reset_presenter_build(&feed, &state, &model); reset_ui_update(&model); lv_refr_now(NULL);
+        ++qr_checks;
+        if (!find_qr(lv_screen_active())) ++qr_failures;
+    }
+    lv_mem_monitor(&qr_after);
+    qr_stress_ok = qr_stress_ok && same_live_memory(&qr_before, &qr_after) && lv_mem_test() == LV_RESULT_OK;
+    printf("QR 100 page cycles: before_free=%zu after_free=%zu; %s\n",
+           qr_before.free_size, qr_after.free_size, qr_stress_ok ? "PASS" : "FAIL");
+    memset(model.announcement_source_url, 'x', sizeof(model.announcement_source_url));
+    render(argv[1], "48-source-unterminated-fallback", &model);
+    feed.data.latest.observed = true;
+    CAPTURE_READER();
+    SHOW("49-source-observed-fallback");
+    feed.data.latest.observed = false;
+    feed.data.latest.source_url[0] = '\0';
+    state.reading_page = 0;
+    state.page = RESET_UI_HOME;
+    SHOW("02-merged-reset-overview");
+    static reset_feed_snapshot_t saved_feed;
+    saved_feed = feed;
+    reset_presenter_state_t saved_state = state;
+    feed.data.scheduled.present = feed.data.scheduled.has_time = true;
+    feed.data.scheduled.kind = RESET_KIND_REGULAR;
+    feed.data.scheduled.announced_at = feed.data.latest.announced_at - 3600;
+    feed.data.scheduled.scheduled_for = state.now + 7200;
+    snprintf(feed.data.scheduled.text, sizeof(feed.data.scheduled.text), "This planned reset remains the selected event even when another announcement is newer.");
+    snprintf(feed.data.scheduled.source_url, sizeof(feed.data.scheduled.source_url), "https://x.com/test/status/123");
+    SHOW("50-schedule-priority-future");
+    bool future_hold_ok = stress_hold(&model) && stress_cancel(&model);
+    printf("Future time-panel hold/cancel stability: %s\n", future_hold_ok ? "PASS" : "FAIL");
+    CAPTURE_READER(); state.page = RESET_UI_READING; state.reading_page = 0;
+    SHOW("51-scheduled-reader-captured");
+    feed.data.scheduled.present = false;
+    snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "This replacement must not appear in the open reader.");
+    state.settings.utc_offset_minutes = 840;
+    SHOW("52-reader-frozen-after-api-and-zone-change");
+    bool snapshot_ok = !strcmp(model.announcement_text, reader.text) &&
+        !strcmp(model.zone, reader.zone) && !strcmp(model.announcement_source_url, reader.source_url);
+    state.reading_page = 8;
+    SHOW("53-frozen-reader-source-qr");
+    feed = saved_feed; state = saved_state;
+    printf("Reader displayed-event snapshot across feed/timezone change: %s\n", snapshot_ok ? "PASS" : "FAIL");
+
+    reset_history_snapshot_t history = {.has_data = true, .status = RESET_FEED_CURRENT};
+    history.data.start_day = reset_history_window_start(state.now);
+    history.data.through_at = state.now;
+    memset(history.data.cells, RESET_HISTORY_KNOWN, sizeof(history.data.cells));
+    for (unsigned i = 0; i < RESET_HISTORY_DAYS; i += 9) history.data.cells[i] |= RESET_HISTORY_REGULAR;
+    for (unsigned i = 3; i < RESET_HISTORY_DAYS; i += 13) history.data.cells[i] |= RESET_HISTORY_BANKED;
+    history.data.cells[18] = RESET_HISTORY_KNOWN | RESET_HISTORY_REGULAR | RESET_HISTORY_BANKED;
+    state.history = &history; state.page = RESET_UI_HISTORY;
+    SHOW("54-history-known-synthetic");
+    bool history_cases_ok = model.history_cells[18] == RESET_HISTORY_DAY_BOTH;
+    history.data.cells[4] = 0; history.stale = true;
+    SHOW("55-history-unknown-retained-cache");
+    history_cases_ok = history_cases_ok && model.history_cells[4] == RESET_HISTORY_DAY_UNKNOWN;
+    history.loading = true;
+    SHOW("56-history-updating-retained-cache");
+    history.loading = false; history.has_data = false; history.status = RESET_FEED_ERROR;
+    SHOW("57-history-failed-unknown-not-empty");
+    history_cases_ok = history_cases_ok && model.history_cells[0] == RESET_HISTORY_DAY_UNKNOWN;
+    history.has_data = true; history.stale = false; history.status = RESET_FEED_CURRENT;
+    state.now -= 3 * 86400;
+    SHOW("58-history-future-days-distinct");
+    history_cases_ok = history_cases_ok && model.history_cells[RESET_HISTORY_DAYS - 1] == RESET_HISTORY_DAY_FUTURE;
+    state.clock_ready = false;
+    SHOW("59-history-clock-pending");
+    history_cases_ok = history_cases_ok && model.history_cells[0] == RESET_HISTORY_DAY_UNKNOWN;
+    state.clock_ready = true; state.now += 3 * 86400;
+    printf("History cells: mixed types, unknown, failed coverage and future distinction; %s\n", history_cases_ok ? "PASS" : "FAIL");
+    uint8_t saved_history_cells[RESET_HISTORY_DAYS];
+    memcpy(saved_history_cells, history.data.cells, sizeof(saved_history_cells));
+    memset(history.data.cells, RESET_HISTORY_KNOWN | RESET_HISTORY_REGULAR | RESET_HISTORY_BANKED, sizeof(history.data.cells));
+    SHOW("60-history-worst-all-mixed");
+    bool history_hold_ok = stress_hold(&model) && stress_cancel(&model);
+    printf("History all-%u-mixed-cell hold/cancel stability: %s\n", RESET_HISTORY_DAYS, history_hold_ok ? "PASS" : "FAIL");
+    history_cases_ok = history_cases_ok && history_hold_ok;
+    memcpy(history.data.cells, saved_history_cells, sizeof(saved_history_cells));
     state.page = RESET_UI_STATS;
     SHOW("03-statistics");
     state.page = RESET_UI_SETTINGS;
@@ -531,7 +777,7 @@ int main(int argc, char **argv) {
     state.connected = false;
     state.wifi_error = true;
     SHOW("14-network-error");
-    state.page = RESET_UI_OVERVIEW;
+    state.page = RESET_UI_HOME;
     feed.data.latest.kind = RESET_KIND_BANKED;
     feed.data.latest.observed = true;
     SHOW("15-banked-observation");
@@ -555,9 +801,10 @@ int main(int argc, char **argv) {
     memset(feed.data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
     feed.data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
     SHOW("22-long-source-time-only-home");
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
     unsigned wide_pages = reset_ui_reading_page_count();
-    bool text_cases_ok = wide_pages > 1 && wide_pages <= RESET_TEXT_MAX_PAGES;
+    bool text_cases_ok = future_hold_ok && history_cases_ok && snapshot_ok && qr_stress_ok && wide_pages > 1 && wide_pages <= RESET_TEXT_MAX_PAGES + 1;
     for (unsigned page = 0; page < wide_pages; ++page) {
         char name[64]; snprintf(name, sizeof(name), "23-wide-word-reader-%u", page + 1);
         state.reading_page = page; SHOW(name);
@@ -567,6 +814,7 @@ int main(int argc, char **argv) {
     state.page = RESET_UI_HOME; state.reading_page = 0;
     SHOW("24-long-url-time-only-home");
     unsigned url_pages = reset_ui_reading_page_count();
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
     for (unsigned page = 0; page < url_pages; ++page) {
         char name[64]; snprintf(name, sizeof(name), "25-long-url-reader-%u", page + 1);
@@ -575,12 +823,15 @@ int main(int argc, char **argv) {
     snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "Original text with emoji 🙂 and unsupported glyph 龘.\r\n新公告：常规重置已执行。\tNo remote translation is used.");
     state.page = RESET_UI_HOME; state.reading_page = 0;
     SHOW("26-missing-glyph-time-only-home");
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
     SHOW("27-missing-glyph-reader");
     feed.data.latest.text_truncated = true;
+    CAPTURE_READER();
     SHOW("28-truncated-and-substituted-reader");
     memset(feed.data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
     feed.data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
+    CAPTURE_READER();
     SHOW("29-source-byte-limit-reader");
     feed.data.latest.text_truncated = false;
     for (unsigned i = 0; i < 64; ++i) {
@@ -591,9 +842,10 @@ int main(int argc, char **argv) {
     }
     state.page = RESET_UI_HOME;
     SHOW("30-page-limit-time-only-home");
-    text_cases_ok = text_cases_ok && reset_ui_reading_page_count() == 8;
+    text_cases_ok = text_cases_ok && reset_ui_reading_page_count() == 9;
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
-    for (unsigned page = 0; page < RESET_TEXT_MAX_PAGES; ++page) {
+    for (unsigned page = 0; page < RESET_TEXT_MAX_PAGES + 1; ++page) {
         char name[64]; snprintf(name, sizeof(name), "31-page-limit-reader-%u", page + 1);
         state.reading_page = page; SHOW(name);
     }
@@ -617,13 +869,30 @@ int main(int argc, char **argv) {
     SHOW("35b-forecast-missing-glyphs");
     feed.data.watch.present = false;
     feed.data.latest.present = true;
-    state.page = RESET_UI_OVERVIEW;
+    state.page = RESET_UI_HOME;
     const int64_t ages[] = { 0, 59, 60, 59 * 60, 3600, 23 * 3600, 118800, 99 * 86400 + 23 * 3600, 9999LL * 86400, 10000LL * 86400 };
     for (unsigned i = 0; i < sizeof(ages) / sizeof(ages[0]); ++i) {
         char name[64]; snprintf(name, sizeof(name), "36-relative-age-case-%u", i);
         feed.data.latest.announced_at = state.now - ages[i]; SHOW(name);
     }
     printf("Bounded original-text scenarios: %u wide-word pages, %u URL pages, all 8 page-limit pages, glyph fallbacks; %s\n", wide_pages, url_pages, text_cases_ok ? "PASS" : "FAIL");
+    /* Optical centring must also hold when the latest card is compact. */
+    feed.data.scheduled.present = feed.data.scheduled.has_time = true;
+    feed.data.scheduled.kind = RESET_KIND_REGULAR;
+    feed.data.scheduled.scheduled_for = state.now + 7200;
+    state.page = RESET_UI_HOME;
+    for (unsigned i = 0; i < sizeof(ages) / sizeof(ages[0]); ++i) {
+        char name[64]; snprintf(name, sizeof(name), "61-compact-time-case-%u", i);
+        feed.data.latest.announced_at = state.now - ages[i]; SHOW(name);
+    }
+    feed.data.latest.announced_at = state.now + 1;
+    SHOW("62-compact-time-awaiting-clock");
+    feed.data.latest.present = false;
+    SHOW("63-compact-time-no-latest");
+    feed.data.scheduled.has_time = false;
+    SHOW("64-planned-time-unpublished-centred");
+    feed.data.scheduled.present = false;
+    feed.data.latest.present = true;
     /* Recovery diagnostics: numeric codes only, no SSID or password. */
     state.page = RESET_UI_SETUP; state.connected = false; state.provisioning = false;
     state.wifi_initialized = false; state.wifi_last_error = 0;
@@ -711,6 +980,7 @@ int main(int argc, char **argv) {
     /* Reader page navigation and truncation states use exactly the same bounded
      * objects; measure after an identical warm-up, not a different page type. */
     lv_mem_monitor_t reader_before = {0}, reader_after = {0};
+    CAPTURE_READER();
     state.page = RESET_UI_READING;
     for (unsigned i = 0; i < 64; ++i) {
         feed.data.latest.text[4 * i] = 'A' + i % 26;
@@ -719,10 +989,11 @@ int main(int argc, char **argv) {
         feed.data.latest.text[4 * i + 3] = '\n';
     }
     feed.data.latest.text[256] = '\0';
+    CAPTURE_READER();
     for (unsigned pass = 0; pass < 2; ++pass) {
         for (unsigned i = 0; i < 500; ++i) {
             state.reading_page = i % 8;
-            feed.data.latest.text_truncated = i % 2;
+            reader.truncated = i % 2;
             reset_presenter_build(&feed, &state, &model);
             audit_page = model.page;
             reset_ui_update(&model);
@@ -736,14 +1007,15 @@ int main(int argc, char **argv) {
     printf("Reader stress: 500 page/truncation changes, warmed free=%zu final=%zu blocks=%zu/%zu; %s\n", reader_before.free_size, reader_after.free_size, reader_before.used_cnt, reader_after.used_cnt, reader_ok ? "PASS" : "FAIL");
     feed.data.latest.text_truncated = false;
 #undef SHOW
+#undef CAPTURE_READER
     /* Replay both phases of the allocator's observed two-batch placement
-     * cycle. Each 500-change endpoint must match its own warmed endpoint
+     * cycle. Each 600-change endpoint must match its own warmed endpoint
      * exactly, in both live blocks and free bytes: no growth tolerance. */
     lv_mem_monitor_t warm_memory[2] = {{0}}, memory = {0};
     bool memory_ok = true;
     for (unsigned pass = 0; pass < 2; ++pass) {
         for (unsigned phase = 0; phase < 2; ++phase) {
-            for (unsigned i = 0; i < 500; ++i) {
+            for (unsigned i = 0; i < 600; ++i) {
                 state.page = (reset_ui_page_t)(i % 4);
                 reset_presenter_build(&feed, &state, &model);
                 reset_ui_update(&model);
@@ -760,12 +1032,17 @@ int main(int argc, char **argv) {
     }
     memory_ok = memory_ok && lv_mem_test() == LV_RESULT_OK;
     if (!memory_ok) fprintf(stderr, "LVGL allocation did not stabilize across page changes\n");
-    printf("LVGL 24 KiB pool after 1000 measured page changes: max_used=%zu, "
+    printf("LVGL 24 KiB pool after 1200 measured page changes: max_used=%zu, "
            "free=%zu, largest_free=%zu, fragmentation=%u%%\n",
            memory.max_used, memory.free_size, memory.free_biggest_size, memory.frag_pct);
+    printf("QR object checks: %u, failures=%u\n", qr_checks, qr_failures);
+    printf("Actual time-ink centring checks: %u, failures=%u\n", time_center_checks, time_center_failures);
+    printf("HOME semantic palette probes: %u, failures=%u\n", home_palette_checks, home_palette_failures);
+    printf("History visible-margin checks: %u, failures=%u\n", history_margin_checks, history_margin_failures);
+    printf("History pixel probes: %u, failures=%u\n", history_cell_checks, history_cell_failures);
     printf("Audited %u actual LVGL labels: %u missing glyphs, %u clipped labels\n",
            label_count, missing_count, clipped_count);
     lv_display_delete(display);
     lv_deinit();
-    return missing_count || clipped_count || !memory_ok || !hold_ok || !cancel_ok || !scenarios_ok || !text_cases_ok || !reader_ok ? 1 : 0;
+    return missing_count || clipped_count || history_cell_failures || history_margin_failures || home_palette_failures || time_center_failures || qr_failures || !memory_ok || !hold_ok || !cancel_ok || !scenarios_ok || !text_cases_ok || !reader_ok ? 1 : 0;
 }

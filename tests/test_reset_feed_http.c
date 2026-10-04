@@ -56,6 +56,14 @@ static int read_calls;
 static char sent_etag[RESET_ETAG_CAPACITY];
 static bool task_creation_fail;
 static unsigned notifications;
+static const char *history_pages[RESET_HISTORY_MAX_PAGES + 1];
+static int history_codes[RESET_HISTORY_MAX_PAGES + 1];
+static const char *history_retries[RESET_HISTORY_MAX_PAGES + 1];
+static char history_urls[RESET_HISTORY_MAX_PAGES + 1][RESET_HISTORY_URL_CAPACITY];
+static unsigned history_calls;
+static unsigned live_clients;
+static unsigned pause_after_cleanup;
+static bool pause_after_headers;
 
 static void reset_fixture(void)
 {
@@ -86,6 +94,17 @@ static void reset_fixture(void)
     s_fetching = false;
     s_paused = false;
     s_refresh_pending = false;
+    s_history_pending = false;
+    s_history_fetching = false;
+    s_history_needs_verification = false;
+    memset(&s_history, 0, sizeof(s_history));
+    memset(&s_history_staging, 0, sizeof(s_history_staging));
+    memset(history_pages, 0, sizeof(history_pages));
+    memset(history_codes, 0, sizeof(history_codes));
+    memset(history_retries, 0, sizeof(history_retries));
+    memset(history_urls, 0, sizeof(history_urls));
+    history_calls = live_clients = pause_after_cleanup = 0;
+    pause_after_headers = false;
     s_cache_needs_verification = false;
     s_restore_pending = false;
     s_restore_hard_backoff_at = 0;
@@ -114,7 +133,20 @@ int64_t esp_timer_get_time(void)
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config)
 {
     ++init_calls;
-    assert(strcmp(config->url, "https://codex-resets.com/api/v1/status") == 0);
+    assert(live_clients == 0); /* No second TLS heap, even across history pages. */
+    if (strncmp(config->url, RESET_HISTORY_URL "?", strlen(RESET_HISTORY_URL) + 1) == 0) {
+        assert(history_calls < RESET_HISTORY_MAX_PAGES + 1);
+        strcpy(history_urls[history_calls], config->url);
+        if (history_pages[history_calls]) {
+            wire_body = history_pages[history_calls];
+            wire_length = strlen(wire_body);
+            wire_position = 0;
+            announced_length = (int64_t)wire_length;
+            status_code = history_codes[history_calls] ? history_codes[history_calls] : 200;
+            retry_header = history_retries[history_calls];
+        }
+        ++history_calls;
+    } else assert(strcmp(config->url, RESET_FEED_URL) == 0);
     assert(config->transport_type == HTTP_TRANSPORT_OVER_SSL);
     assert(config->method == HTTP_METHOD_GET);
     assert(config->crt_bundle_attach == esp_crt_bundle_attach);
@@ -123,6 +155,7 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *co
     assert(config->max_authorization_retries == -1);
     assert(config->timeout_ms > 0 && config->timeout_ms <= 10000);
     saved_config = *config;
+    if (!init_fail) ++live_clients;
     return init_fail ? NULL : &saved_config;
 }
 
@@ -165,6 +198,10 @@ int64_t esp_http_client_fetch_headers(esp_http_client_handle_t client)
     emit_header("retry-after", retry_header);
     emit_header("Content-Type", content_type);
     emit_header("Content-Encoding", content_encoding);
+    if (pause_after_headers) {
+        pause_after_headers = false;
+        assert(!reset_feed_pause_and_wait(0));
+    }
     return announced_length;
 }
 
@@ -203,6 +240,12 @@ esp_err_t esp_http_client_cleanup(esp_http_client_handle_t client)
 {
     assert(client);
     ++cleanup_calls;
+    assert(live_clients == 1);
+    --live_clients;
+    if (pause_after_cleanup == (unsigned)cleanup_calls) {
+        pause_after_cleanup = 0;
+        assert(!reset_feed_pause_and_wait(0));
+    }
     return ESP_OK;
 }
 
@@ -663,7 +706,9 @@ static void test_rtc_preserves_bounded_text(void)
     assert(reset_feed_pause_and_wait(0));
     reset_feed_rtc_state_t state;
     assert(reset_feed_export_rtc(&state));
-    assert(state.version == 3 && state.size == sizeof(state));
+    assert(state.version == 5 && state.size == sizeof(state));
+    assert(strcmp(state.data.latest.source_url, "https://x.com/thsottiaux/status/123") == 0);
+    assert(state.data.scheduled.source_url[0] == '\0');
     assert(strlen(state.data.latest.text) == RESET_FEED_TEXT_MAX_BYTES);
     assert(state.data.latest.text_truncated && state.data.latest.text_has_non_ascii);
     assert(state.data.scheduled.present && state.data.scheduled.observed);
@@ -688,9 +733,11 @@ static void test_rtc_preserves_bounded_text(void)
 
     reset_fixture();
     reset_feed_rtc_state_t bad = state;
-    bad.version = 2; /* Previous cache layout cannot masquerade as current. */
-    bad.checksum = rtc_checksum(&bad);
-    assert(!reset_feed_import_rtc(&bad));
+    for (uint32_t version = 0; version < 5; ++version) {
+        bad.version = version; /* Previous layouts cannot masquerade as current. */
+        bad.checksum = rtc_checksum(&bad);
+        assert(!reset_feed_import_rtc(&bad));
+    }
     bad = state;
     memset(bad.data.latest.text, 'a', sizeof(bad.data.latest.text));
     bad.checksum = rtc_checksum(&bad);
@@ -706,6 +753,248 @@ static void test_rtc_preserves_bounded_text(void)
     assert(!s_snapshot.has_data && !s_restore_pending);
 }
 
+static void test_rtc_source_urls(void)
+{
+    reset_feed_rtc_state_t state = cached_state(false);
+    state.data.latest.present = true;
+    state.data.scheduled.present = true;
+    strcpy(state.data.latest.source_url, "https://x.com/thsottiaux/status/123");
+    strcpy(state.data.scheduled.source_url, "https://twitter.com/thsottiaux/status/456?s=20");
+    state.checksum = rtc_checksum(&state);
+    reset_fixture();
+    assert(reset_feed_import_rtc(&state));
+    reset_feed_snapshot_t snapshot;
+    reset_feed_get_snapshot(&snapshot);
+    assert(strcmp(snapshot.data.latest.source_url, state.data.latest.source_url) == 0);
+    assert(strcmp(snapshot.data.scheduled.source_url, state.data.scheduled.source_url) == 0);
+    assert(reset_feed_pause_and_wait(0));
+    reset_feed_rtc_state_t second;
+    assert(reset_feed_export_rtc(&second));
+    assert(memcmp(&second.data, &state.data, sizeof(state.data)) == 0);
+
+    for (unsigned record = 0; record < 2; ++record) {
+        for (unsigned failure = 0; failure < 6; ++failure) {
+            reset_feed_rtc_state_t bad = state;
+            char *url = record ? bad.data.scheduled.source_url : bad.data.latest.source_url;
+            if (failure == 0) memset(url, 'a', RESET_FEED_SOURCE_URL_MAX_BYTES + 1U);
+            else if (failure == 1) strcpy(url, "https://x.com.evil.example/123");
+            else if (failure == 2) strcpy(url, "https://x.com/\xe9\x87\x8d");
+            else if (failure == 3) strcpy(url, "https://x.com/123\n");
+            else if (failure == 4) strcpy(url, "http://x.com/123");
+            else if (record) bad.data.scheduled.observed = true;
+            else bad.data.latest.observed = true;
+            bad.checksum = rtc_checksum(&bad);
+            reset_fixture();
+            assert(!reset_feed_import_rtc(&bad));
+            assert(!s_snapshot.has_data && !s_restore_pending);
+        }
+    }
+    state.data.latest.source_url[0] = '\0';
+    state.data.scheduled.source_url[0] = '\0';
+    state.data.latest.observed = true;
+    state.data.scheduled.observed = true;
+    state.checksum = rtc_checksum(&state);
+    assert(reset_feed_import_rtc(&state)); /* Empty observed fallback is valid. */
+}
+
+
+static const char history_empty[] =
+    "{\"data\":[],\"pagination\":{\"has_more\":false,\"next_cursor\":null},"
+    "\"meta\":{\"api_version\":\"v1\",\"generated_at\":\"2026-10-04T07:46:40Z\"}}";
+static const char history_first[] =
+    "{\"data\":[{\"id\":\"first\",\"reset_type\":\"regular\",\"announced_at\":\"2026-10-01T12:00:00Z\","
+    "\"text\":\"reset\",\"source\":{\"type\":\"observed\"}}],"
+    "\"pagination\":{\"has_more\":true,\"next_cursor\":\"Abc_DEF-012\"},"
+    "\"meta\":{\"api_version\":\"v1\",\"generated_at\":\"2026-10-04T07:46:40Z\"}}";
+static const char history_final[] =
+    "{\"data\":[{\"id\":\"second\",\"reset_type\":\"banked\",\"announced_at\":\"2026-10-01T13:00:00Z\","
+    "\"text\":\"reset\",\"source\":{\"type\":\"observed\"}}],"
+    "\"pagination\":{\"has_more\":false,\"next_cursor\":null},"
+    "\"meta\":{\"api_version\":\"v1\",\"generated_at\":\"2026-10-04T07:46:40Z\"}}";
+
+static response_t history_cycle(void)
+{
+    response_t response;
+    assert(reset_feed_request_history());
+    assert(admit_history(monotonic_ms(), fake_wall_time));
+    fetch_history(&response);
+    assert(cleanup_calls == init_calls && live_clients == 0);
+    apply_history_response(&response, monotonic_ms(), fake_wall_time);
+    return response;
+}
+
+static void test_history_http_and_cache(void)
+{
+    reset_fixture();
+    assert(reset_feed_start() == ESP_OK);
+    assert(!s_history_pending); /* No boot-time history traffic. */
+    strcpy(s_etag, "\"status-only\"");
+    s_poll.next_attempt_ms = 123456;
+    history_pages[0] = history_first;
+    history_pages[1] = history_final;
+    response_t response = history_cycle();
+    assert(response.error == RESET_FEED_ERROR_NONE);
+    assert(history_calls == 2 && !s_history_fetching && !s_fetching);
+    assert(sent_etag[0] == 0 && strcmp(s_etag, "\"status-only\"") == 0);
+    assert(strstr(history_urls[0], "&to=2026-10-04T07%3A46%3A40Z&limit=25&order=asc"));
+    assert(!strstr(history_urls[0], "cursor="));
+    assert(strstr(history_urls[1], "&cursor=Abc_DEF-012"));
+    assert(s_poll.next_attempt_ms == 123456); /* Does not postpone status. */
+    reset_history_snapshot_t snapshot;
+    reset_feed_get_history_snapshot(&snapshot);
+    assert(snapshot.has_data && !snapshot.stale && !snapshot.loading);
+    assert(snapshot.data.cells[RESET_HISTORY_DAYS - 4] == 0x83);
+    assert(snapshot.data.cells[0] == RESET_HISTORY_KNOWN);
+    assert(reset_feed_request_history() && !s_history_pending);
+    assert(!admit_history(30000, fake_wall_time + 30)); /* Six-hour success floor. */
+
+    /* A newer status announcement invalidates even the six-hour cache. */
+    s_snapshot.has_data = true;
+    s_snapshot.data.latest.present = true;
+    s_snapshot.data.latest.announced_at = s_history.data.through_at + 1;
+    reset_feed_get_history_snapshot(&snapshot);
+    assert(snapshot.stale);
+    assert(reset_feed_request_history() && s_history_pending);
+    assert(!admit_history(29999, fake_wall_time)); /* Still shares debounce. */
+    fake_monotonic_us = 30000000;
+    assert(admit_history(30000, fake_wall_time));
+    history_pages[2] = "{broken";
+    reset_history_data_t cached = s_history.data;
+    fetch_history(&response);
+    apply_history_response(&response, 30000, fake_wall_time);
+    reset_feed_get_history_snapshot(&snapshot);
+    assert(snapshot.has_data && snapshot.stale && snapshot.error == RESET_FEED_ERROR_FORMAT);
+    assert(memcmp(&s_history.data, &cached, sizeof(cached)) == 0);
+    assert(strcmp(s_etag, "\"status-only\"") == 0);
+    assert(!reset_feed_request_refresh()); /* Shared history failure backoff. */
+}
+
+static void test_history_incomplete_and_retry(void)
+{
+    for (unsigned failure = 0; failure < 5; ++failure) {
+        reset_fixture();
+        assert(reset_feed_start() == ESP_OK);
+        history_pages[0] = history_first;
+        history_pages[1] = history_final;
+        if (failure == 0) history_codes[1] = 429;
+        if (failure == 1) history_pages[1] = history_first; /* Duplicate page/cursor. */
+        if (failure == 2) history_codes[1] = 304; /* No history validator. */
+        if (failure == 3) body_incomplete = true;
+        if (failure == 4) history_pages[1] = "{\"data\":[]}";
+        history_retries[1] = "900";
+        response_t response = history_cycle();
+        assert(response.error != RESET_FEED_ERROR_NONE);
+        reset_history_snapshot_t snapshot;
+        reset_feed_get_history_snapshot(&snapshot);
+        assert(!snapshot.has_data && snapshot.stale && !snapshot.loading);
+        for (unsigned day = 0; day < RESET_HISTORY_DAYS; ++day) assert(snapshot.data.cells[day] == 0);
+        assert(!s_snapshot.has_data && !s_etag[0]);
+        if (failure == 0) {
+            assert(snapshot.error == RESET_FEED_ERROR_RATE_LIMIT);
+            assert(snapshot.retry_in_seconds == 900);
+            assert(reset_feed_request_history());
+            assert(!admit_history(899999, fake_wall_time));
+            assert(!admit_fetch(899999, fake_wall_time));
+        }
+    }
+}
+
+static void test_history_readiness_pause_and_budget(void)
+{
+    reset_fixture();
+    assert(!reset_feed_request_history());
+    assert(reset_feed_start() == ESP_OK);
+    reset_feed_set_ready(false, false);
+    assert(reset_feed_request_history());
+    assert(!admit_history(0, fake_wall_time) && history_calls == 0);
+    reset_feed_set_ready(true, false);
+    assert(!admit_history(0, fake_wall_time));
+    reset_feed_set_ready(false, true);
+    assert(!admit_history(0, fake_wall_time));
+    assert(reset_feed_pause_and_wait(0));
+    assert(!s_history_pending && !reset_feed_request_history());
+    reset_feed_resume(false);
+    assert(!s_history_pending);
+
+    for (unsigned pause = 0; pause < 2; ++pause) {
+        reset_fixture();
+        assert(reset_feed_start() == ESP_OK);
+        history_pages[0] = history_first;
+        history_pages[1] = history_final;
+        pause_after_headers = pause == 0;
+        pause_after_cleanup = pause == 1 ? 1 : 0;
+        response_t response = history_cycle();
+        assert(response.error == RESET_FEED_ERROR_NETWORK);
+        assert(history_calls == 1 && !s_history.has_data);
+        assert(reset_feed_pause_and_wait(0)); /* Cleanup precedes ACK. */
+        assert(live_clients == 0 && !s_fetching && !s_history_pending);
+    }
+
+    /* A shared30s deadline, not a fresh30s on each page. */
+    reset_fixture();
+    assert(reset_feed_start() == ESP_OK);
+    char pages[RESET_HISTORY_MAX_PAGES][512];
+    for (unsigned i = 0; i < RESET_HISTORY_MAX_PAGES; ++i) {
+        snprintf(pages[i], sizeof(pages[i]),
+            "{\"data\":[{\"id\":\"id-%u\",\"reset_type\":\"regular\",\"announced_at\":\"2026-10-01T12:00:00Z\","
+            "\"text\":\"\",\"source\":{\"type\":\"observed\"}}],"
+            "\"pagination\":{\"has_more\":true,\"next_cursor\":\"cursor-%u\"},"
+            "\"meta\":{\"api_version\":\"v1\",\"generated_at\":\"2026-10-04T07:46:40Z\"}}", i, i);
+        history_pages[i] = pages[i];
+    }
+    read_advance_us = 5000000; /* Two reads per small page,10s/page. */
+    response_t response = history_cycle();
+    assert(response.error == RESET_FEED_ERROR_NETWORK);
+    assert(history_calls == 3 && monotonic_ms() == 30000 && !s_history.has_data);
+
+    /* Fast responses instead reach the page cap, still without publication. */
+    reset_fixture();
+    assert(reset_feed_start() == ESP_OK);
+    for (unsigned i = 0; i < RESET_HISTORY_MAX_PAGES; ++i) history_pages[i] = pages[i];
+    response = history_cycle();
+    assert(response.error == RESET_FEED_ERROR_FORMAT && history_calls == RESET_HISTORY_MAX_PAGES);
+    assert(!s_history.has_data && !s_history_staging.complete);
+}
+
+static void test_history_rollover_and_rtc(void)
+{
+    reset_fixture();
+    assert(reset_feed_start() == ESP_OK);
+    history_pages[0] = history_empty;
+    assert(history_cycle().error == RESET_FEED_ERROR_NONE);
+    assert(reset_feed_pause_and_wait(0));
+    reset_feed_rtc_state_t state;
+    assert(reset_feed_export_rtc(&state));
+    assert(state.version == 5 && state.has_history && reset_history_data_valid(&state.history));
+    reset_fixture();
+    assert(reset_feed_import_rtc(&state));
+    reset_history_snapshot_t snapshot;
+    reset_feed_get_history_snapshot(&snapshot);
+    assert(snapshot.has_data && snapshot.stale); /* Verify again after deep sleep. */
+    assert(memcmp(&snapshot.data, &state.history, sizeof(snapshot.data)) == 0);
+    for (unsigned bad_case = 0; bad_case < 4; ++bad_case) {
+        reset_feed_rtc_state_t bad = state;
+        if (bad_case == 0) bad.history.cells[0] = 4;
+        if (bad_case == 1) bad.history.cells[0] &= ~RESET_HISTORY_KNOWN;
+        if (bad_case == 2) bad.history.start_day += 86400;
+        if (bad_case == 3) bad.history_last_checked_at = bad.history.through_at - 1;
+        bad.checksum = rtc_checksum(&bad);
+        reset_fixture();
+        assert(!reset_feed_import_rtc(&bad));
+    }
+    reset_fixture();
+    assert(reset_feed_start() == ESP_OK);
+    s_history.has_data = true;
+    s_history.data = state.history;
+    s_history.last_checked_at = state.history_last_checked_at;
+    /* Sunday→Monday creates a new last column, whose elapsed day is UNKNOWN. */
+    fake_wall_time = 1791158400; /* 2026-10-05T00:00:00Z */
+    reset_feed_get_history_snapshot(&snapshot);
+    assert(snapshot.stale && snapshot.data.start_day == state.history.start_day + 7 * INT64_C(86400));
+    assert(snapshot.data.cells[RESET_HISTORY_DAYS - 7] == 0);
+    assert(reset_feed_request_history() && s_history_pending);
+}
+
 int main(void)
 {
     test_fetch_and_cache();
@@ -716,6 +1005,11 @@ int main(void)
     test_rtc_wake_and_corruption();
     test_rtc_preserves_backoff();
     test_rtc_preserves_bounded_text();
+    test_rtc_source_urls();
+    test_history_http_and_cache();
+    test_history_incomplete_and_retry();
+    test_history_readiness_pause_and_budget();
+    test_history_rollover_and_rtc();
     puts("Reset feed HTTPS fault-injection tests: PASS");
     return 0;
 }

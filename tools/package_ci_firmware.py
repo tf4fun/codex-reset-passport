@@ -18,7 +18,7 @@ out.mkdir(parents=True, exist_ok=False)
 shutil.copyfile(image, out / image.name)
 (out / "SHA256SUMS").write_text(f"{digest}  {image.name}\n")
 (out / "manifest.json").write_text(json.dumps({
-    "application": "Codex Reset v2.3", "target": "esp32c3", "flash_size": "8MB",
+    "application": "Codex Reset v2.4", "target": "esp32c3", "flash_size": "8MB",
     "flash_offset": "0x0", "idf_version": "5.5.3",
     "source_commit": os.environ.get("GITHUB_SHA", subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()),
     "github_run_id": os.environ.get("GITHUB_RUN_ID"),
@@ -27,7 +27,7 @@ shutil.copyfile(image, out / image.name)
     "validated_build_manifest": manifest,
     "checks": {"static_and_host": "passed before packaging in CI", "firmware_and_merge": "passed before packaging in CI", "device": "not run"}
 }, indent=2) + "\n")
-(out / "FLASHING.txt").write_text("Codex Reset v2.3; ESP32-C3, 8MB flash.\n"
+(out / "FLASHING.txt").write_text("Codex Reset v2.4; ESP32-C3, 8MB flash.\n"
     "Verify SHA256SUMS before flashing the merged full.bin at offset 0x0.\n"
     "Merged flashing can reset stored NVS settings/Wi-Fi credentials.\n"
     "Do not use full-chip erase. Flash only the device and image authorized by its owner.\n"

@@ -2,136 +2,200 @@
 
 # Actual LVGL reset UI preview
 
-The host harness directly compiles firmware `main/reset_ui.c`,
-`reset_presenter.c`, `reset_text.c`, the bounded feed parser and production
-`reset_hold.c`. It renders with pinned LVGL 9.5 at 240 × 320 RGB565, a 40-row
-partial buffer and the unchanged 24 KiB LVGL pool. The flush callback calls the
-actual BSP rounded-row helper with radius 30 from `bsp_display.h`. This is not
-an HTML recreation, device photograph, network request or flash operation.
+The harness compiles the actual firmware UI, presenter, bounded text layout,
+feed/history parsers, UTC history helpers and production hold state machine.
+It uses pinned LVGL 9.5, 240 × 320 RGB565, a 40-row partial buffer and the
+unchanged 24 KiB LVGL pool. The flush callback uses the real BSP rounded-row
+helper with radius 30. It performs no network request, upload or device flash.
 
-## Run
+## Run and provenance
 
-Requires a C/C++ compiler, CMake, Python with Pillow and resolved managed LVGL
-sources. From the repository root:
+Requires C/C++, CMake, Python with Pillow and resolved managed LVGL sources:
 
 ```bash
 python3 tools/render_reset_preview.py
 python3 tools/render_reset_preview.py --feed /path/to/captured-status.json
+python3 tools/render_reset_preview.py --history-feed /path/to/captured-history.json
+python3 tools/render_reset_preview.py --history-weeks 6 \
+  --build-dir build/reset-ui-preview-six --output build/six-week-preview
 ```
 
-The optional feed must already exist locally. The real firmware parser checks
-it; `generated_at` is the reference clock and battery is unavailable. Captured
-screens are named `00-captured-*` (home, reader pages and overview). They are not
-a current live query. All other screens use clearly labeled synthetic fixtures.
-Use `--build-dir` and a fresh `--output` directory as needed. Existing output
-files are retained. Neither command changes managed LVGL files.
+The optional captures must already exist locally. Actual firmware parsers
+validate them. History input must contain one complete captured pagination
+cycle; a partial page is rejected. Response `meta.generated_at` supplies the
+preview clock, and captured screens have unavailable battery. Screens named
+`00-captured-*` use these captures; all others are synthetic fixtures. The tool
+records source/capture hashes, timestamps and the actual compiled week count.
+It is not a live query or device photograph. Use a fresh `--output` directory
+when scenarios change; older output files are not deleted.
 
-## Announcement and reader contract
+## Four pages and immutable reading selection
 
-The four top-level pages are announcement, last executed reset overview,
-statistics and settings. HOME short-confirm opens the reading child. Reading
-UP/DOWN changes text pages; short-confirm returns HOME. Hold-to-sleep remains
-independent. Settings has seven rows, including automatic sleep after 5 minutes
-by default, with 0/off, 5, 10 and 30-minute values.
+The four top pages are overview, UTC history calendar, statistics and settings.
+There is no separate duplicate latest-reset overview page.
 
-- HOME chooses the newer `announced_at` from `latest_reset` and
-  `scheduled_reset`, never a watch's `observed_at`. The time-only HOME shows
-  Chinese relative time as the hero, a secondary absolute local date, and a
-  small reset type/status. It has no body summary or dense reader instructions.
-- Expected timing uses a supplied schedule, explicitly labeled as planned and
-  shown in the configured fixed UTC offset. Missing schedule times stay pending;
-  overdue schedules await confirmation. Without a schedule, only an unexpired
-  forecast's raw `forecast_window` is presented as a prediction. An expired
-  forecast is not a valid plan. Average intervals never create a forecast.
-- Overview uses the latest executed record: regular CODEX quota reset or
-  explicitly banked/backup-quota distribution. Exact local date/time is secondary
-  to Chinese relative time. The note says the time follows the site's record;
-  announcement/observation time is not claimed as precise execution time.
-- Text is bounded to 256 source UTF-8 bytes. Actual active LVGL glyph advances,
-  including pair kerning, fit 178 pixels. Whitespace is preferred; unbroken
-  words/URLs break at complete codepoint boundaries. CR/LF and TAB are normalized.
-- HOME short-confirm still opens the reader. The fixed 16px reading body uses
-  seven lines per page, at most eight pages. Only a quiet date, small page number
-  and domain surround the text; a notice appears only when required. Byte/page clipping has
-  an explicit notice. Unsupported glyphs become `?` with a visible warning.
-  The original text is never translated, executed or treated as markup.
-- Bounded static buffers own the label strings. No text heap allocation, full
-  CJK font, remote translation, clickable-link or QR promise is introduced.
-  The readable feed-site domain is `codex-resets.com`.
+- HOME always places the future card above the latest-history card. If a
+  scheduled record exists, its card is large, regardless of which announcement
+  is newer; the latest reset becomes a short lower card. Otherwise, the upper
+  card says next time is unpublished (or shows a clearly labelled prediction),
+  and the latest executed record gets the large lower card. Colours always
+  identify the event: future stays sky blue at either size; latest stays white
+  with a yellow time emphasis, including its compact form. They do not exchange
+  colours when their sizes change. The large future card has a light-blue
+  time plate with a blue edge, mirroring the large latest card's title/time/
+  date/timezone hierarchy without borrowing its yellow accent.
+- Planned times use actual `scheduled_for` in the configured fixed UTC offset.
+  Null stays unpublished. A passed planned time awaits confirmation, never
+  becomes completed merely because the clock passed it.
+- Latest uses Chinese relative time with exact local date/time and explicit
+  regular/banked type. This is the site's announcement/observation record,
+  not a claim of an exact execution instant.
+- A watch never replaces a scheduled or historical primary record. Only an
+  unexpired, clock-verified watch may appear in the small future card, labelled
+  prediction and optionally probability. A bounded/truncated/unsupported-glyph
+  prediction visibly says that material was omitted or replaced. No timestamp
+  is invented from its prose. Historical average belongs only in statistics,
+  labelled as historical; it is not a fixed reset period or a forecast.
+- HOME short-confirm opens the large card's original text only when a record
+  exists. The application captures the last successfully displayed HOME model
+  before entry. The bounded reader snapshot freezes text, type, date, zone,
+  truncation flags and source; live API/timezone changes cannot silently swap
+  the open record. No valid snapshot means no live-feed reader fallback.
+- Reading UP/DOWN changes pages and short-confirm returns HOME. Body uses
+  fixed 16px text, seven lines per page, at most eight text pages. Wrapping uses
+  actual LVGL glyph advances/kerning in 178px, preferring whitespace and then
+  complete UTF-8 codepoints for unbroken words/URLs. Input is at most 256 bytes;
+  CR/LF/TAB normalize safely. Missing glyphs become `?`, and byte/page clipping
+  is explicitly marked. Only a quiet date/page number/source name surrounds
+  normal text. There is no translation, markup execution or text heap.
+- A ninth maximum page contains the exact selected-source QR or explicitly
+  labelled data-site fallback. The 192px white square reserves four modules of
+  quiet zone and integral modules of at least 3px. URLs are bounded, validated,
+  never cut, and retain the selected snapshot's source.
 
-The 12/16px fonts cover the fixed UI and printable ASCII. A 25-glyph 24px subset
-is derived directly from the Chinese relative-time formatter. Regeneration and
-license information are in [the assets record](../../assets/README.md#codex-reset-observer-ui-subset).
+The seven settings rows, automatic-screen-off/grace behavior and warm moon
+hold animation are not changed by the presentation/reader work.
 
-## What the audits prove
+## History calendar
 
-The harness checks both body-font inventories, the hero subset, known missing
-U+9F98, every visible label's actual selected font, line widths, reserved body
-line budgets and screen/parent bounds. Fixtures cover:
+One `RESET_HISTORY_WEEKS` compile-time value drives query, cache, presenter and
+UI. Default is eight weeks; six is supported without a device setting. Columns
+are UTC Monday-start weeks, rows Monday through Sunday, with UTC month labels
+and date range independent of the local announcement-display offset.
 
-- HOME, every top/child page, 7-row settings, offline/stale data and network errors
-- new scheduled announcement, banked/regular executed or planned states,
-  overdue/null schedule, raw prediction, watch-only, expired and clipped forecasts
-- all four 256-byte wide-word pages, all two unbroken-URL pages,
-  emoji/noncovered Chinese substitution, CR/LF/TAB and source-byte truncation
-- all eight newline-heavy pages, explicit page-limit notice and index clamping
-- Chinese relative times from just now to 99 days/23 hours and beyond 9999 days
+- Regular: orange `#FF5C29`; banked: peach `#FFAD7C`
+- Both kinds on one day: a split-colour cell, not an invented count
+- Verified no reset: warm grey; unknown: white outlined; future: pale
+- Only a fully validated complete API pagination cycle marks coverage known;
+  pending, failed or uncovered days never become grey empty days
+- Cached overlap is retained and reprojected; new uncovered days stay unknown
+- Pending network/clock, loading, stale cache and failed updates are distinct
 
-The reader runs 500 page/truncation changes after the identical warm-up and
-requires exact live-allocation/free-space equality. Four-top-page navigation is
-also replayed for 1000 measured changes. Two successive 500-change endpoints
-are each 4664 free bytes at 208 live blocks in the diagnostic run. Each measured phase
-must match its own warmed phase exactly; there is no growth tolerance.
-The final v2.3 run audited 90248 visible labels: zero missing glyphs and zero
-clipped labels. The unchanged 24 KiB pool peaked at 17712 bytes; final top-page
-free space was 4664 bytes. These are host-pool results, not device heap results.
+One custom-draw object paints the lighter calendar frame, all 56 (or 42) cells,
+and legend keys. Cells are 14px with 21px horizontal/20px vertical pitch: 7px
+horizontal and 6px vertical clear gaps. Solid dates no longer have heavy black
+outlines; unknown cells retain their distinguishing outline. The entire table (weekday labels, cells and month labels) is shifted 3px
+left as a group. The default eight-week actual visible bounds are x=26..210,
+leaving 7px/8px inside-frame side gaps; six-week positioning centres that same
+complete group. Month labels clamp to the group
+right-side padding. Status sits beside the date range, leaving a spaced,
+centred two-line legend. All text remains at its previous font size.
+The seven weekday labels remain one multiline object at 20px row positions.
+Geometry is shared with the pixel probes in `main/reset_ui_layout.h`; the
+retained-background hold overlay still fits in the unchanged 24 KiB pool.
 
-PNG/PPM files, `synthetic-states-contact-sheet.png`, `audit.txt`, source hashes
-and `manifest.json` are saved by default under `build/reset-ui-preview/screens/`.
-A nonzero exit reports failure even when screenshots exist. Inspect the actual
-screens after changes. Device brightness, battery ADC, physical buttons, BLE,
-Wi-Fi/HTTPS pressure, credentials and on-device Chinese display remain untested
-by this harness. A host render is not `Device tests: PASS`.
+The real 8-week capture used for `00-captured-history.png` contains 16 records
+in one complete page, with response generation time 2026-10-04T14:55:20.166Z.
+Its displayed UTC window is 2026-08-10 through 2026-10-04. This historical capture
+is distinct from synthetic mixed/unknown/future stress fixtures.
 
-## Setup-only Wi-Fi diagnostics
+## Audits
 
-The setup screen distinguishes starting, initialization failure, no saved
-network, connecting attempt `n/5`, retry waiting, and connected-but-save-failed.
-Settings shows the corresponding brief Wi-Fi state. Diagnostic lines display
-numeric codes only: `E` is an error code and `D` is the last disconnect reason.
-They contain no SSID or password and do not assert a root cause. Runtime and
-credential-persistence errors are independent and can be shown together.
-An active provisioning countdown stays visible even if an IP is acquired while
-credential saving fails. The time-only HOME and seven-line reader are unchanged.
-Fixtures `37`–`45` include INT32_MIN/MAX, UINT16_MAX, both errors together,
-provisioning countdown plus save failure, and all startup/retry states.
+Font coverage checks both body fonts, the tiny relative-time font, and known
+missing U+9F98. Every visible label's actual font, width, reserved line budget,
+screen and parent bounds are checked. Fixtures cover all four top pages,
+settings/setup errors, schedule older than latest, planned null/overdue time,
+watch-only/expired forecast, long words/URLs, unsupported glyphs, byte/page
+limits, all eight text pages and frozen reader/source across API/zone changes.
 
-## v2.3 hold-to-sleep preview
+History cases include real capture, partial coverage, loading/error, future
+cells, unknown clock, and all 56 cells containing both reset kinds. Independent
+pixel probes verify both halves of every rendered cell against its model state.
+HOME, QR and worst-case history each run 500 actual hold progress frames and
+100 cancel/open-close cycles with stable objects and exact warmed allocation
+counts/free bytes. QR also runs 100 reader/source page cycles and 111 actual-QR-object checks;
+  an unavailable-message-only page fails rather than passing label audits. Reader changes
+run 500 iterations; all four top pages run 1200 measured changes. There is no
+allocator-growth tolerance.
 
-The three clean 240 × 320 GIFs use actual production press/release/tick events:
+The final default 8-week host run audited 317614 labels with zero missing glyphs
+and zero clipping. All 582 HOME semantic-colour probes and 1672 calendar
+colour/clear-gap probes passed. Pool peak was 18288/24576 bytes (the restored
+baseline peaked at 18648). Worst-case history hold retained 23 objects and 223
+live allocations with 4104 bytes free before/after; cancel returned to 193
+allocations and 5864 bytes free. These are host-pool results, not ESP32 total-heap acceptance.
 
-- `v2.3-fast-tap-no-popup-actual-lvgl.gif`: a 200ms tap emits one TAP, opens the
-  announcement reader and never creates a sleep popup.
-- `v2.3-release-1250ms-unwind-actual-lvgl.gif`: appears at 500ms, fills for the
-  next 750ms, then reverses its last displayed value over 250ms. Returns HOME
-  without a TAP or sleep event.
-- `v2.3-full-hold-release-cleanup-actual-lvgl.gif`: appears at 500ms and fills
-  during the next 1500ms. Release at 2000ms plus 250ms continuously observed
-  all-keys-up produces exactly one sleep intent and enters network cleanup.
+Independent pixel QR decoding requires Pillow and zxing-cpp:
 
-Each starts with 400ms of HOME. Frames are sampled every 20ms, with exact event
-boundaries also sampled (sometimes 10ms). GIF merging of identical frames is
-allowed only with preserved dimensions and total encoded duration. The cancel
-fixture preserves progress 493/1000 from 1240ms instead of advancing on release.
-`hold-scenarios.json` records timings/events; `hold-to-sleep-progress-strip.png`
-shows the 0/25/50/100 fill states without numbers on the UI.
+```bash
+python3 tests/test_reset_qr_decode.py build/v2.4-history-final/screens
+```
 
-The warm cream/ink modal, geometric crescent and persistent LVGL arc are
-unchanged. No framebuffer snapshot or countdown is used. The underlying page
-is retained and hidden during the modal, then restored. Progress stress checks
-500 frames with stable object identity/count, zero deletions, exact warmed
-allocation equality and allocator integrity. Another 100 cancel/open-close
-cycles check the hidden tap window and unchanged underlying objects. Final
-progress had 21 objects, 216 allocations and 4744 bytes free before/after;
-cancel-close had 186 allocations and 6496 bytes free before/after. Reader stress
-had 149 allocations and 8832 bytes free before/after.
+It verifies six actual QR outputs: fallback, maximum URL, malformed/observed
+  fallback, frozen selected source, and the captured API source. Exact URLs,
+  integral 3px-or-larger modules and full quiet zone must all match.
+The frozen-reader QR also decodes to the original planned source after live-feed
+and timezone changes. This does not prove optical scanning on the real LCD.
+
+Output includes PNG/PPM, a labelled synthetic contact sheet, `audit.txt`,
+`manifest.json`, `hold-scenarios.json` and hold GIFs. Nonzero exit means a failed
+audit even if images exist. Brightness, battery ADC, physical buttons, radio/TLS
+memory pressure, credentials, LCD rendering and phone scanning remain device
+tests. Host rendering is not `Device tests: PASS`.
+
+## Preserved hold GIFs
+
+- `v2.3-fast-tap-no-popup-actual-lvgl.gif`: 200ms ordinary TAP opens the captured
+  record's reader without a popup
+- `v2.3-release-1250ms-unwind-actual-lvgl.gif`: shows at 500ms, unwinds the last
+  displayed progress for 250ms after release, without TAP or sleep intent
+- `v2.3-full-hold-release-cleanup-actual-lvgl.gif`: fills at 2000ms total; release
+  plus 250ms continuous all-keys-up emits one sleep intent and enters cleanup
+
+Each starts with 400ms of HOME. Sampling is normally 20ms, plus exact event
+boundaries. Encoded GIF dimensions and total duration are verified. The ring,
+geometric crescent and warm palette remain unchanged, without numeric countdown
+or framebuffer snapshot. The underlying page is retained and hidden during the
+modal; object identity and allocation audits verify this behavior.
+
+QR allocation admission uses actual I1 canvas stride × height, palette and
+alignment sizes for both the constructor-default and requested canvas, because
+LVGL allocates the replacement before releasing the default. It separately
+budgets draw descriptors, encoder scratch and conservative object overhead.
+Total free memory covers the peak; largest-block admission covers individual
+allocations, avoiding the former fixed 6000-byte false rejection after capture/
+history navigation. The post-canvas dual-scratch guard remains in place.
+
+## Visual-polish regression boundary
+
+The restored v2.4 source was rendered before the visual-only changes. Ordinary
+reading, statistics, settings, the hold progress frame and frozen-source QR
+PNGs remain byte-identical to that baseline. The changed screens are HOME card
+colour/hierarchy/time placement and calendar spacing/frame/legend. Presenter, feed, controls, networking, screen-off behavior, QR
+encoding/URL/budget logic and font assets are unchanged. Both short and full
+fixture sequences still undergo the original memory and independent QR tests.
+
+### Time-plate optical centring
+
+The large blue future plate and both latest yellow time containers centre the
+union of actual font glyph bounds using LVGL's line height, baseline, glyph
+box height and y offset. Odd spare pixels round upward; this avoids depending
+on the larger line box or guessed per-string offsets. The rendered-pixel check
+requires top/bottom ink margins to differ by at most one pixel. All 210 checks
+pass, including compact 99-day/23-hour, 9999-day, just-now, unknown-time and
+no-record states. The extra future-plate widget also runs the original 500-frame
+hold and 100-cancel-cycle stress with exact stable allocations. The time-plate refinement did not change history. The later, requested
+margin-only adjustment moves its complete table left without changing cell
+size, pitch, fonts, data or legend. Eight actual visible-bound checks require
+both inner side gaps to be at least 7px and differ by at most 1px; all pass.
+Both HOME-state PNGs remain byte-identical to the final time-plate revision.

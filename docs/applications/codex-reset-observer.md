@@ -1,6 +1,6 @@
 **English** · [简体中文](codex-reset-observer.zh_CN.md)
 
-# Codex Reset Observer v2.3
+# Codex Reset Observer v2.4
 
 Independent, read-only announcement display for the 240 × 320 AI Passport.
 Data comes from [Codex Resets](https://codex-resets.com); this is not OpenAI
@@ -9,9 +9,10 @@ label and pink/blue statistic cards adapt the reference site's visual style.
 
 ## Four pages and controls
 
-Up/Down switch Announcement, Reset Overview, Statistics, and Settings. A short
-Confirm on Announcement enters the full-text reader; Up/Down then turn text
-pages and Confirm returns to Announcement. Confirm refreshes Overview/Statistics.
+Up/Down switch Overview, Recent History, Statistics, and Settings. A short Confirm on Overview
+opens the original text for its large time display; Up/Down turn text/source pages
+and Confirm returns to Overview. With no selected event, Confirm does not open
+an empty reader. Confirm on Statistics refreshes the data.
 On Settings, Confirm enters its options; Up/Down select and Confirm changes or
 opens the selected option.
 A Confirm tap released before 500 ms performs only the ordinary short-press
@@ -35,32 +36,70 @@ prompt uses short Confirm to erase or Up/Down to cancel. The separate hardware p
 as an application navigation or sleep button: no readable short-press event
 is established by this BSP.
 
-Announcement chooses the newer announcement time from the latest executed reset
-and an explicit scheduled reset; it does not pretend to cover every news item.
-Type/status distinguish regular reset, banked-credit issuance and pending plan.
-The page emphasizes relative time, with absolute date and a small type label;
-announcement prose appears only after Confirm opens the full-text reader.
-The expected-time panel uses scheduled_for when supplied, clearly labelled as a
-plan; an elapsed schedule still awaits confirmation. Without a plan, an unexpired
-watch can show its original forecast window, explicitly labelled prediction.
-An expired watch is not a valid prediction and averages never predict a reset.
-If neither supplies a time, the panel says it has not been announced.
+Overview always shows the future section above the latest executed event.
+An explicit schedule expands the upper card with its actual local time, an
+unannounced-time state, or “awaiting confirmation” once the scheduled time passes;
+the latest event remains visible in the small lower card. Without a schedule,
+the upper future card stays compact and the latest event expands below it with
+Chinese relative time. Schedule presence, not announcement recency, determines
+which card is primary and therefore which original text Confirm opens. Future
+cards remain light blue at either size; latest-event cards remain white with
+yellow time emphasis. Colour follows the event kind rather than card size. Regular resets and banked-credit issuance remain distinct. No announcement
+prose is shown on Overview. An unexpired watch is only a secondary prediction,
+never a confirmed schedule or a replacement for the main historical event.
 
-Reset Overview uses Chinese relative-time wording for the latest executed event,
-with local absolute date/time secondary. Banked credits are labelled separately.
-The time is the site's announcement/observation record, not an independently
-measured execution instant. Statistics retain total, average interval and elapsed
-days; absent values remain unknown and longest interval is not invented.
+Historical average interval stays on Statistics to keep both event cards clear.
+It is context, not a fixed reset cycle or a
+calculated next reset date. Unknown values stay unknown. Statistics retain total,
+average interval and elapsed days; longest interval is not invented. The latest
+event's time is the site's announcement/observation record, not an independently
+measured execution instant.
+
+The readable record is captured only after the overview has actually rendered.
+Entering the reader freezes its text, source, date, type and timezone together;
+API updates or timezone changes cannot silently replace that record or QR link
+while reading. A failed render lock cannot select data the user has not seen.
 
 Announcement text is retained as valid UTF-8, at most 256 bytes per record,
 without cutting a codepoint; the forecast window is limited to 96 bytes. The
 reader wraps and paginates by actual font pixel width, including unbroken URLs.
 The reader keeps a simple date, page number and unobtrusive source footer.
-It has an explicit maximum of eight pages; truncation/glyph-fallback notices
+It has an explicit maximum of eight text pages; truncation/glyph-fallback notices
 appear only when needed. Unsupported glyphs use safe replacement, not silent disappearance or a
 full CJK font download. API text is shown in its original language, without
-remote translation or hardcoded current content. The source domain is readable;
-the LCD does not promise a clickable source link.
+remote translation or hardcoded current content. The quiet footer says Codex Resets.
+An independent final reader page adds a real QR, leaving text-page reading area
+unchanged. It encodes the selected event's exact HTTPS source URL (120-byte bound,
+X/Twitter/Codex Resets host allowlist). Observed/missing/invalid/oversized sources
+use `https://codex-resets.com/zh-CN`, labelled data source rather than original.
+The bundled LVGL encoder uses medium error correction, integer modules of at
+least three pixels and at least four white modules on all sides inside 192px.
+Allocation failure shows an unavailable message. UP/DOWN wrap through text plus
+source; confirm returns home. RTC cache v5 retains the validated history window and rejects incompatible earlier layouts.
+
+## Recent history
+
+A compact calendar shows a recent UTC window, initially eight Monday-first weeks,
+including the current week. `RESET_HISTORY_WEEKS` is shared by query, cache and
+rendering and supports six/eight weeks without a device setting. The eight-week
+layout uses 14 px cells with 7 px horizontal and 6 px vertical gaps, keeps 12 px
+labels, and separates the legend from the grid. It does not fetch
+the complete historical archive. The chart uses UTC day boundaries explicitly;
+local-offset time elsewhere does not change its buckets.
+
+Regular and banked events have separate marks; both can occur in the same cell.
+Future dates and unknown dates are distinct from known days without an event.
+Only a completely validated pagination cycle can establish empty days through
+its query cutoff. Partial, failed or capped responses never become an all-clear
+calendar; a previous complete cache stays visibly stale or missing days remain
+unknown. Grid flags describe event kinds, not invented per-day counts.
+
+History is requested lazily on entry or Confirm and uses the existing HTTP
+worker, TLS verification, pause acknowledgement and backoff. A cycle allows at
+most four pages of 25 records, 16 KiB per response and 30 seconds total. TLS is
+released before JSON parsing; no second parallel TLS session is opened. A complete
+cache is reused for up to six hours, but a new UTC day/week or newer known reset
+invalidates freshness. Restored RTC history remains unverified until checked. Automatic screen-off/deep sleep retains its original safety gates.
 
 ## Settings
 
@@ -72,16 +111,27 @@ the LCD does not promise a clickable source link.
   published rate limit.
 - Local time: explicit fixed UTC offset in 15-minute steps, from UTC−12 to UTC+14.
   Default UTC; no guessed location and no automatic daylight-saving changes.
-- Brightness: 20/45/75%. Normal viewing dims after 30 seconds and blanks after
-  two minutes; first input then only wakes the display. Active pairing/hold and
-  shutdown keep the display lit.
-- Network setup and confirmed network deletion are separate actions.
-- Automatic deep sleep: 5/10/30 minutes or off, default 5. Only user button
-  activity resets idle; API updates do not. Pairing, held keys, gestures and
-  cancellation/shutdown pause the timer. Cancellation or a failed attempt adds
-  a five-minute retry cooldown, rather than a tight retry loop. The preference
-  is saved in NVS; old settings without the new key default to 5 without losing
-  remembered Wi-Fi OFF.
+- Brightness: 20/45/75%. Normal viewing dims after 30 seconds. Automatic
+  screen-off is 5/10/30 idle minutes or off, default 5, measured cumulatively
+  from the last button activity (not added after dimming). Off keeps the
+  30-second dim but disables both automatic screen-off and deep sleep.
+- At the configured timeout the screen goes dark, then grants a fixed 15-second
+  grace with network and peripherals still running. Only after that does safe
+  shutdown begin. The first key wakes the screen and consumes its whole gesture;
+  it never navigates, changes a setting, or opens the manual hold overlay.
+- Automatic shutdown never opens the sleep page or relights the display.
+  Reversible failure resumes services while staying dark, with a five-minute
+  retry cooldown followed by a new 15-second grace. Irreversible failure safely
+  restarts with a one-shot dark-screen marker; the first key restores viewing.
+  That marker applies only to a controlled software restart, never physical
+  power-on or deep-sleep wake. Manual sleep retains its visible feedback.
+- Only actual user button activity resets idle; API updates do not. Pairing,
+  held keys, gestures, settings editing, cancellation and shutdown pause it.
+  Network setup and confirmed network deletion remain separate actions.
+- The existing NVS key `sleep_minutes` and 5/10/30/off values are preserved.
+  Upgrading reinterprets the remembered value as the screen-off timeout plus
+  15-second grace; it does not reset preferences or Wi-Fi credentials. Stores
+  without the key default to 5 minutes, preserving remembered Wi-Fi OFF.
 - Manual deep sleep remains available through the completed hold-and-release
   gesture. Both paths share the same safe shutdown. They perform no
   periodic wake or background update. Bottom Confirm is the primary intended wake key, **not yet

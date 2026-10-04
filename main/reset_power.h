@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-// Explicit, user-confirmed manual sleep only. Call from the application owner
+// Manual hold or policy-admitted automatic sleep. Call from the application owner
 // task, never from a button/LVGL callback. Stop feed/radio work before prepare.
 // Waits at most release_timeout_ms (capped at 2000 ms) for stable ADC release,
 // then safely releases ADC buttons and arms only the C3 GPIO LOW wake source.

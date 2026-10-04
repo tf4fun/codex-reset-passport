@@ -56,3 +56,6 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
 # Explicit GPIO-only deep sleep; GPIO0 has an external pull-up.
 CONFIG_ESP_SLEEP_GPIO_ENABLE_INTERNAL_RESISTORS=n
+
+# Source QR: bundled LVGL encoder; no network or short-link service.
+CONFIG_LV_USE_QRCODE=y

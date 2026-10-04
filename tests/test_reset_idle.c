@@ -154,6 +154,64 @@ static void test_clock_discontinuities(void) {
     assert(!reset_idle_due(NULL, 5, UINT64_MAX));
 }
 
+static void test_screen_grace(void) {
+    const uint16_t choices[] = {5, 10, 30};
+    for (unsigned n = 0; n < 3; ++n) {
+        reset_idle_t idle = {0};
+        reset_idle_screen_t screen = {0};
+        uint64_t deadline = choices[n] * MINUTE_MS;
+        reset_idle_observe(&idle, 0, false, false);
+        assert(reset_idle_brightness(&screen, &idle, 45) == 45);
+        reset_idle_observe(&idle, 29999, false, false);
+        assert(reset_idle_brightness(&screen, &idle, 45) == 45);
+        reset_idle_observe(&idle, 30000, false, false);
+        assert(reset_idle_brightness(&screen, &idle, 45) == 8);
+        reset_idle_observe(&idle, 120000, false, false);
+        assert(!reset_idle_screen_tick(&screen, &idle, choices[n], 120000, false));
+        assert(!screen.screen_off); /* No legacy fixed two-minute blank. */
+        reset_idle_observe(&idle, deadline - 1, false, false);
+        assert(!reset_idle_screen_tick(&screen, &idle, choices[n], deadline - 1, false));
+        assert(!screen.screen_off);
+        reset_idle_observe(&idle, deadline, false, false);
+        assert(!reset_idle_screen_tick(&screen, &idle, choices[n], deadline, false));
+        assert(screen.screen_off && reset_idle_brightness(&screen, &idle, 45) == 0);
+        assert(!reset_idle_screen_tick(&screen, &idle, choices[n], deadline + 14999, false));
+        assert(reset_idle_screen_tick(&screen, &idle, choices[n], deadline + 15000, false));
+        /* A real press at the exact admission edge wins; reset idle as owner. */
+        reset_idle_observe(&idle, deadline + 15000, true, false);
+        assert(!reset_idle_screen_tick(&screen, &idle, choices[n], deadline + 15000, true));
+        assert(!screen.screen_off && !screen.grace_active);
+        assert(reset_idle_brightness(&screen, &idle, 45) == 45);
+    }
+    reset_idle_t idle = {0};
+    reset_idle_screen_t screen = {0};
+    reset_idle_observe(&idle, 0, false, false);
+    reset_idle_observe(&idle, 30 * MINUTE_MS, false, false);
+    assert(!reset_idle_screen_tick(&screen, &idle, 0, 30 * MINUTE_MS, false));
+    assert(!screen.screen_off && reset_idle_brightness(&screen, &idle, 45) == 8);
+    /* Delayed observations always grant a full grace, never retroactive sleep. */
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 30 * MINUTE_MS, false));
+    assert(!reset_idle_screen_tick(&screen, &idle, 0, 30 * MINUTE_MS + 1, false));
+    assert(!screen.screen_off && !screen.grace_active); /* Off cancels grace. */
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 30 * MINUTE_MS + 2, false));
+    reset_idle_observe(&idle, 30 * MINUTE_MS + 3, false, true);
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 31 * MINUTE_MS, false));
+    assert(screen.screen_off && !screen.grace_active); /* Held/queued input blocks. */
+    reset_idle_observe(&idle, 31 * MINUTE_MS, false, false);
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 31 * MINUTE_MS, false));
+    assert(reset_idle_screen_tick(&screen, &idle, 5, 31 * MINUTE_MS + 15000, false));
+    reset_idle_defer_after_cancel_or_failure(&idle, 31 * MINUTE_MS + 15000);
+    reset_idle_screen_failed(&screen);
+    assert(screen.screen_off && !screen.grace_active);
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 36 * MINUTE_MS + 14999, false));
+    reset_idle_observe(&idle, 36 * MINUTE_MS + 15000, false, false);
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 36 * MINUTE_MS + 15000, false));
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 36 * MINUTE_MS + 29999, false));
+    assert(reset_idle_screen_tick(&screen, &idle, 5, 36 * MINUTE_MS + 30000, false));
+    assert(!reset_idle_screen_tick(&screen, &idle, 5, 1, false)); /* Clock rollback. */
+    assert(!screen.grace_active);
+}
+
 #ifdef ESP_PLATFORM
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -302,6 +360,7 @@ static void test_persistence(void) {
 
 int main(void) {
     test_settings();
+    test_screen_grace();
     test_thresholds_and_polls();
     test_pauses_and_user_activity();
     test_failure_and_cancel_cooldown();
