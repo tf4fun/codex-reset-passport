@@ -4,7 +4,8 @@
 #include <string.h>
 int main(void) {
     _Static_assert(RESET_UI_HOME == 0 && RESET_UI_HISTORY == 1 && RESET_UI_STATS == 2 && RESET_UI_SETTINGS == 3 && RESET_UI_READING == 4, "four top pages plus child reader");
-    reset_feed_snapshot_t f = {0};
+    reset_feed_data_t data = {0};
+    reset_feed_snapshot_t f = {.data = &data, .revision = 1};
     reset_presenter_state_t s = {.battery = -1, .now = 1791000000};
     reset_settings_defaults(&s.settings);
     reset_ui_model_t m;
@@ -18,64 +19,66 @@ int main(void) {
     assert(!reset_presenter_capture_reader(&m, NULL));
     s.connected = s.clock_ready = true; s.battery = 75;
     f.has_data = true; f.status = RESET_FEED_CURRENT; f.last_checked_at = s.now;
-    f.data.generated_at = s.now; f.data.latest.present = true;
-    f.data.latest.kind = RESET_KIND_REGULAR; f.data.latest.announced_at = s.now - 118800;
-    strcpy(f.data.latest.text, "Original latest text.");
-    strcpy(f.data.latest.source_url, "https://x.com/test/status/1");
-    f.data.stats.total = 57; f.data.stats.has_avg_interval_days = true; f.data.stats.avg_interval_days = 6.8;
+    data.generated_at = s.now; data.latest.present = true;
+    data.latest.kind = RESET_KIND_REGULAR; data.latest.announced_at = s.now - 118800;
+    strcpy(data.latest.text, "Original latest text.");
+    strcpy(data.latest.source_url, "https://x.com/test/status/1");
+    data.stats.total = 57; data.stats.has_avg_interval_days = true; data.stats.avg_interval_days = 6.8;
     reset_presenter_build(&f, &s, &m);
     assert(m.reading_available && !m.primary_scheduled && !m.next_has_time);
     assert(!strcmp(m.next_title, "最近一次重置") && !strcmp(m.hero, "1天9小时前"));
     assert(!strcmp(m.stats_total, "57") && !strcmp(m.stats_average, "6.8"));
-    assert(!strcmp(m.announcement_text, f.data.latest.text) && strstr(m.announcement_type, "已执行"));
-    assert(m.announcement_source_original && !strcmp(m.announcement_source_url, f.data.latest.source_url));
+    assert(!strcmp(m.announcement_text, data.latest.text) && strstr(m.announcement_type, "已执行"));
+    assert(m.announcement_source_original && !strcmp(m.announcement_source_url, data.latest.source_url));
     /* A newer watch is strictly secondary, never the reader selection. */
-    f.data.watch.present = true; f.data.watch.observed_at = s.now;
-    f.data.watch.expires_at = s.now + 3600; f.data.watch.confidence_percent = 87;
-    strcpy(f.data.watch.forecast_window, "within the next few hours");
+    data.watch.present = true; data.watch.observed_at = s.now;
+    data.watch.expires_at = s.now + 3600; data.watch.confidence_percent = 87;
+    strcpy(data.watch.forecast_window, "within the next few hours");
     reset_presenter_build(&f, &s, &m);
     assert(m.timing_is_forecast && m.forecast_confidence == 87);
-    assert(!strcmp(m.announcement_text, f.data.latest.text) && !strcmp(m.next_body, f.data.watch.forecast_window));
+    assert(!strcmp(m.announcement_text, data.latest.text) && !strcmp(m.next_body, data.watch.forecast_window));
     assert(!m.primary_scheduled && !m.next_has_time && !strcmp(m.hero, "1天9小时前"));
-    f.data.watch.expires_at = s.now;
+    data.watch.expires_at = s.now;
     reset_presenter_build(&f, &s, &m); assert(!m.timing_is_forecast && !m.next_body[0]);
-    f.data.watch.expires_at = s.now + 3600; s.clock_ready = false;
+    data.watch.expires_at = s.now + 3600; s.clock_ready = false;
     reset_presenter_build(&f, &s, &m); assert(!m.timing_is_forecast);
     s.clock_ready = true;
     /* A scheduled record wins even when its announcement is OLDER. */
-    f.data.scheduled.present = f.data.scheduled.has_time = true;
-    f.data.scheduled.kind = RESET_KIND_REGULAR;
-    f.data.scheduled.announced_at = f.data.latest.announced_at - 3600;
-    f.data.scheduled.scheduled_for = s.now + 7200;
-    strcpy(f.data.scheduled.text, "Original planned reset text.");
-    strcpy(f.data.scheduled.source_url, "https://twitter.com/test/status/2");
+    data.scheduled.present = data.scheduled.has_time = true;
+    data.scheduled.kind = RESET_KIND_REGULAR;
+    data.scheduled.announced_at = data.latest.announced_at - 3600;
+    data.scheduled.scheduled_for = s.now + 7200;
+    strcpy(data.scheduled.text, "Original planned reset text.");
+    strcpy(data.scheduled.source_url, "https://twitter.com/test/status/2");
     reset_presenter_build(&f, &s, &m);
     assert(m.primary_scheduled && m.next_has_time && m.reading_available);
     assert(!strcmp(m.next_title, "下一次重置") && !strcmp(m.next_time, "06:00") && !strcmp(m.next_date, "2026-10-03"));
-    assert(!strcmp(m.announcement_text, f.data.scheduled.text) && !strcmp(m.announcement_source_url, f.data.scheduled.source_url));
+    assert(!strcmp(m.announcement_text, data.scheduled.text) && !strcmp(m.announcement_source_url, data.scheduled.source_url));
     assert(strstr(m.next_status, "已计划") && m.timing_is_forecast);
     /* Null remains unpublished; an expired planned time never means executed. */
-    f.data.scheduled.has_time = false;
+    data.scheduled.has_time = false;
     reset_presenter_build(&f, &s, &m);
     assert(!m.next_has_time && !strcmp(m.next_time, "暂未公布") && m.primary_scheduled);
-    f.data.scheduled.has_time = true; f.data.scheduled.scheduled_for = s.now - 60;
+    data.scheduled.has_time = true; data.scheduled.scheduled_for = s.now - 60;
     reset_presenter_build(&f, &s, &m);
     assert(strstr(m.next_status, "等待确认") && !strstr(m.next_status, "已执行"));
-    f.data.scheduled.kind = RESET_KIND_BANKED;
+    data.scheduled.kind = RESET_KIND_BANKED;
     reset_presenter_build(&f, &s, &m); assert(strstr(m.announcement_type, "备用额度"));
-    f.data.scheduled.scheduled_for = 1790982000; /* 2026-10-02 23:00 UTC */
+    data.scheduled.scheduled_for = 1790982000; /* 2026-10-02 23:00 UTC */
     s.settings.utc_offset_minutes = 120;
-    f.data.scheduled.text_truncated = true;
+    data.scheduled.text_truncated = true;
     reset_presenter_build(&f, &s, &m);
     assert(!strcmp(m.next_date, "2026-10-03") && !strcmp(m.next_time, "01:00") && !strcmp(m.zone, "UTC+02:00"));
     assert(reset_presenter_capture_reader(&m, &saved) && saved.valid);
+    assert(m.announcement_text == data.scheduled.text && saved.text == m.announcement_text);
+    assert(saved.revision == f.revision); /* No original-text copy in either view. */
     assert(saved.truncated && saved.source_original);
     /* The open reader keeps all of its event fields through source replacement,
      * timezone change, expiry and even complete loss of live feed data. */
     s.page = RESET_UI_READING; s.reader_snapshot = &saved; s.reading_page = 8;
-    f.data.scheduled.present = false;
-    strcpy(f.data.latest.text, "A new live record must not replace the open one.");
-    strcpy(f.data.latest.source_url, "https://x.com/test/status/3");
+    data.scheduled.present = false;
+    strcpy(data.latest.text, "A new live record must not replace the open one.");
+    strcpy(data.latest.source_url, "https://x.com/test/status/3");
     s.settings.utc_offset_minutes = -420; s.now += 86400;
     reset_presenter_build(&f, &s, &m);
     assert(m.reading_available && m.reading_page == 8 && !strcmp(m.announcement_text, saved.text));
@@ -86,18 +89,18 @@ int main(void) {
     reset_presenter_build(&f, &s, &m); assert(m.reading_available && !strcmp(m.announcement_text, saved.text));
     f.has_data = true; s.reader_snapshot = NULL;
     reset_presenter_build(&f, &s, &m);
-    assert(!m.reading_available && strcmp(m.announcement_text, f.data.latest.text));
+    assert(!m.reading_available && strcmp(m.announcement_text, data.latest.text));
     assert(!strcmp(m.announcement_source_url, "https://codex-resets.com/zh-CN"));
     s.reader_snapshot = &saved; saved.valid = false;
     reset_presenter_build(&f, &s, &m); assert(!m.reading_available);
     s.page = RESET_UI_HOME; s.reader_snapshot = NULL;
-    f.data.latest.observed = true; f.data.latest.kind = RESET_KIND_BANKED;
+    data.latest.observed = true; data.latest.kind = RESET_KIND_BANKED;
     reset_presenter_build(&f, &s, &m);
     assert(!m.primary_scheduled && m.reading_available && strstr(m.next_title, "备用额度"));
     assert(!m.announcement_source_original && !strcmp(m.announcement_source_url, "https://codex-resets.com/zh-CN"));
-    f.data.latest.observed = false; f.data.latest.source_url[0] = '\0';
+    data.latest.observed = false; data.latest.source_url[0] = '\0';
     reset_presenter_build(&f, &s, &m); assert(!m.announcement_source_original);
-    f.data.latest.present = false; f.data.watch.expires_at = s.now + 3600;
+    data.latest.present = false; data.watch.expires_at = s.now + 3600;
     reset_presenter_build(&f, &s, &m);
     assert(m.timing_is_forecast && !m.reading_available && !m.primary_scheduled && !m.next_has_time);
     assert(!strcmp(m.next_time, "暂未公布")); /* Historical averages cannot become a plan. */
@@ -111,10 +114,10 @@ int main(void) {
     reset_presenter_build(&f, &s, &m); assert(!strcmp(m.settings_values[4], "关闭"));
     s.page = RESET_UI_TIMEZONE; s.draft_utc_offset = 345;
     reset_presenter_build(&f, &s, &m); assert(!strcmp(m.zone, "UTC+05:45"));
-    s.page = RESET_UI_HOME; f.data.latest.present = true;
-    f.data.latest.announced_at = s.now - 20;
+    s.page = RESET_UI_HOME; data.latest.present = true;
+    data.latest.announced_at = s.now - 20;
     reset_presenter_build(&f, &s, &m); assert(!strcmp(m.hero, "刚刚"));
-    f.data.latest.announced_at = s.now + 1;
+    data.latest.announced_at = s.now + 1;
     reset_presenter_build(&f, &s, &m); assert(!strcmp(m.hero, "时间待核对"));
     s.settings.wifi_enabled = false; s.radio_control_pending = true;
     reset_presenter_build(&f, &s, &m); assert(strstr(m.freshness, "正在关闭"));

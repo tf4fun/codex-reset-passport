@@ -128,7 +128,7 @@ class ResetIdleIntegrationTests(unittest.TestCase):
                           "atomic_exchange(&input_overflow, false)",
                           "automatic_sleep && bsp_button_deep_sleep_had_activity()",
                           "atomic_store(&input_ready, false)",
-                          "if (late_input)", "reset_feed_export_rtc(&rtc_feed)",
+                          "if (late_input)", "reset_feed_retain()",
                           "reset_power_enter_deep_sleep()")
         self.assertRegex(terminal, r"if\s*\(prepare == ESP_OK\s*&&\s*!late_input\s*&&")
         late = block_after(terminal, "if (late_input)")

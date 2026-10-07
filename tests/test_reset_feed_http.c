@@ -55,6 +55,7 @@ static int cleanup_calls;
 static int read_calls;
 static char sent_etag[RESET_ETAG_CAPACITY];
 static bool task_creation_fail;
+static bool mutex_creation_fail, mutex_busy, mutex_held;
 static unsigned notifications;
 static const char *history_pages[RESET_HISTORY_MAX_PAGES + 1];
 static int history_codes[RESET_HISTORY_MAX_PAGES + 1];
@@ -113,10 +114,36 @@ static void reset_fixture(void)
     s_worker = NULL;
     s_last_checked_ms = 0;
     memset(&s_snapshot, 0, sizeof(s_snapshot));
+    memset(&s_retained, 0, sizeof(s_retained));
+    s_snapshot.data = &s_retained.data;
+    s_cache_mutex = NULL;
+    s_reader_pinned = s_reader_refresh_due = false;
     memset(&s_poll, 0, sizeof(s_poll));
     memset(s_etag, 0, sizeof(s_etag));
     notifications = 0;
     task_creation_fail = false;
+    mutex_creation_fail = mutex_busy = mutex_held = false;
+}
+
+SemaphoreHandle_t xSemaphoreCreateMutex(void)
+{
+    return mutex_creation_fail ? NULL : &mutex_held;
+}
+
+BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t timeout)
+{
+    (void)timeout;
+    assert(semaphore == &mutex_held);
+    if (mutex_busy || mutex_held) return 0;
+    mutex_held = true;
+    return pdTRUE;
+}
+
+BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore)
+{
+    assert(semaphore == &mutex_held && mutex_held);
+    mutex_held = false;
+    return pdTRUE;
 }
 
 esp_err_t esp_crt_bundle_attach(void *config)
@@ -297,11 +324,11 @@ static void test_fetch_and_cache(void)
     cached_body_at_headers = true;
     response_t response = fetch();
     assert(response.error == RESET_FEED_ERROR_NONE && !response.unchanged);
-    assert(read_calls >= 1 && response.data.generated_at == INT64_C(1791096513));
+    assert(read_calls >= 1 && s_retained.data.generated_at == INT64_C(1791096513));
     apply_response(&response, 1000, fake_wall_time);
     assert(s_snapshot.has_data && s_snapshot.last_checked_at == fake_wall_time);
     assert(strcmp(s_etag, "\"good-v1\"") == 0);
-    reset_feed_data_t old_data = s_snapshot.data;
+    reset_feed_data_t old_data = *s_snapshot.data;
 
     status_code = 304;
     etag_header = NULL;
@@ -309,7 +336,7 @@ static void test_fetch_and_cache(void)
     assert(response.error == RESET_FEED_ERROR_NONE && response.unchanged);
     assert(strcmp(sent_etag, "\"good-v1\"") == 0);
     apply_response(&response, 301000, fake_wall_time + 300);
-    assert(memcmp(&s_snapshot.data, &old_data, sizeof(old_data)) == 0);
+    assert(memcmp(s_snapshot.data, &old_data, sizeof(old_data)) == 0);
     assert(s_snapshot.last_checked_at == fake_wall_time + 300);
     assert(strcmp(s_etag, "\"good-v1\"") == 0);
 
@@ -319,7 +346,7 @@ static void test_fetch_and_cache(void)
     assert(response.error == RESET_FEED_ERROR_HTTP);
     apply_response(&response, 601000, fake_wall_time + 600);
     assert(s_snapshot.error == RESET_FEED_ERROR_HTTP && s_snapshot.has_data);
-    assert(memcmp(&s_snapshot.data, &old_data, sizeof(old_data)) == 0);
+    assert(memcmp(s_snapshot.data, &old_data, sizeof(old_data)) == 0);
     assert(s_snapshot.last_checked_at == fake_wall_time + 300);
     assert(strcmp(s_etag, "\"good-v1\"") == 0);
 
@@ -706,7 +733,7 @@ static void test_rtc_preserves_bounded_text(void)
     assert(reset_feed_pause_and_wait(0));
     reset_feed_rtc_state_t state;
     assert(reset_feed_export_rtc(&state));
-    assert(state.version == 5 && state.size == sizeof(state));
+    assert(state.version == 6 && state.size == sizeof(state));
     assert(strcmp(state.data.latest.source_url, "https://x.com/thsottiaux/status/123") == 0);
     assert(state.data.scheduled.source_url[0] == '\0');
     assert(strlen(state.data.latest.text) == RESET_FEED_TEXT_MAX_BYTES);
@@ -725,7 +752,7 @@ static void test_rtc_preserves_bounded_text(void)
     reset_feed_snapshot_t snapshot;
     reset_feed_get_snapshot(&snapshot);
     assert(snapshot.has_data && snapshot.stale);
-    assert(memcmp(&snapshot.data, &state.data, sizeof(state.data)) == 0);
+    assert(memcmp(snapshot.data, &state.data, sizeof(state.data)) == 0);
     assert(reset_feed_pause_and_wait(0));
     reset_feed_rtc_state_t second;
     assert(reset_feed_export_rtc(&second));
@@ -733,7 +760,7 @@ static void test_rtc_preserves_bounded_text(void)
 
     reset_fixture();
     reset_feed_rtc_state_t bad = state;
-    for (uint32_t version = 0; version < 5; ++version) {
+    for (uint32_t version = 0; version < 6; ++version) {
         bad.version = version; /* Previous layouts cannot masquerade as current. */
         bad.checksum = rtc_checksum(&bad);
         assert(!reset_feed_import_rtc(&bad));
@@ -765,8 +792,8 @@ static void test_rtc_source_urls(void)
     assert(reset_feed_import_rtc(&state));
     reset_feed_snapshot_t snapshot;
     reset_feed_get_snapshot(&snapshot);
-    assert(strcmp(snapshot.data.latest.source_url, state.data.latest.source_url) == 0);
-    assert(strcmp(snapshot.data.scheduled.source_url, state.data.scheduled.source_url) == 0);
+    assert(strcmp(snapshot.data->latest.source_url, state.data.latest.source_url) == 0);
+    assert(strcmp(snapshot.data->scheduled.source_url, state.data.scheduled.source_url) == 0);
     assert(reset_feed_pause_and_wait(0));
     reset_feed_rtc_state_t second;
     assert(reset_feed_export_rtc(&second));
@@ -850,8 +877,8 @@ static void test_history_http_and_cache(void)
 
     /* A newer status announcement invalidates even the six-hour cache. */
     s_snapshot.has_data = true;
-    s_snapshot.data.latest.present = true;
-    s_snapshot.data.latest.announced_at = s_history.data.through_at + 1;
+    s_retained.data.latest.present = true;
+    s_retained.data.latest.announced_at = s_history.data.through_at + 1;
     reset_feed_get_history_snapshot(&snapshot);
     assert(snapshot.stale);
     assert(reset_feed_request_history() && s_history_pending);
@@ -965,7 +992,7 @@ static void test_history_rollover_and_rtc(void)
     assert(reset_feed_pause_and_wait(0));
     reset_feed_rtc_state_t state;
     assert(reset_feed_export_rtc(&state));
-    assert(state.version == 5 && state.has_history && reset_history_data_valid(&state.history));
+    assert(state.version == 6 && state.has_history && reset_history_data_valid(&state.history));
     reset_fixture();
     assert(reset_feed_import_rtc(&state));
     reset_history_snapshot_t snapshot;
@@ -995,8 +1022,77 @@ static void test_history_rollover_and_rtc(void)
     assert(reset_feed_request_history() && s_history_pending);
 }
 
+static void test_single_cache_and_reader_pin(void)
+{
+    _Static_assert(sizeof(reset_feed_rtc_state_t) < 4096, "Retained current cache stays below 4 KiB");
+    reset_fixture();
+    mutex_creation_fail = true;
+    assert(reset_feed_start() == ESP_ERR_NO_MEM && !s_worker && !s_starting);
+    mutex_creation_fail = false;
+    assert(reset_feed_start() == ESP_OK);
+    response_t response = fetch();
+    apply_response(&response, 0, fake_wall_time);
+    reset_feed_snapshot_t view;
+    assert(reset_feed_lock_snapshot(&view, 0));
+    assert(view.data == &s_retained.data && view.has_data);
+    uint32_t revision = view.revision;
+    assert(!reset_feed_pin_reader(revision)); /* Mutex already held by renderer. */
+    reset_feed_unlock_snapshot();
+    mutex_busy = true;
+    assert(!reset_feed_lock_snapshot(&view, 0) && !reset_feed_pin_reader(revision));
+    mutex_busy = false;
+    assert(!reset_feed_pin_reader(revision + 1));
+    assert(reset_feed_pin_reader(revision));
+    assert(!admit_fetch(900000, fake_wall_time) && !reset_feed_request_refresh());
+    reset_feed_unpin_reader();
+
+    /* A request admitted before entry must not overwrite borrowed body/source
+     * or associate the incoming ETag with the old pinned revision. */
+    fake_monotonic_us = INT64_C(900000000);
+    assert(admit_fetch(900000, fake_wall_time));
+    assert(reset_feed_pin_reader(revision));
+    cJSON *root = cJSON_Parse(body_json);
+    cJSON *stats = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(root, "data"), "stats");
+    cJSON_ReplaceItemInObjectCaseSensitive(stats, "total", cJSON_CreateNumber(42));
+    char *updated = cJSON_PrintUnformatted(root);
+    assert(updated);
+    wire_body = updated; wire_length = strlen(updated); announced_length = (int64_t)wire_length; wire_position = 0;
+    etag_header = "\"new-v2\"";
+    int64_t checked = s_snapshot.last_checked_at;
+    response = fetch();
+    assert(response.error == RESET_FEED_ERROR_NONE && response.deferred);
+    apply_response(&response, 900000, fake_wall_time + 900);
+    assert(view.data->stats.total == 0 && s_snapshot.revision == revision);
+    assert(!strcmp(s_etag, "\"good-v1\"") && s_snapshot.last_checked_at == checked);
+    assert(s_reader_refresh_due && !s_refresh_pending);
+    assert(s_cache_needs_verification);
+    reset_feed_unpin_reader();
+    assert(s_refresh_pending && !admit_fetch(900001, fake_wall_time));
+    fake_monotonic_us = INT64_C(930000000);
+    assert(admit_fetch(930000, fake_wall_time));
+    wire_position = 0;
+    response = fetch();
+    apply_response(&response, 930000, fake_wall_time + 930);
+    assert(!response.deferred && view.data->stats.total == 42 && s_snapshot.revision != revision);
+    assert(!strcmp(s_etag, "\"new-v2\""));
+    assert(!reset_feed_pin_reader(revision)); /* The old view is no longer admissible. */
+    assert(!mutex_held);
+    cJSON_free(updated); cJSON_Delete(root);
+
+    /* The production deep-sleep path seals/restores the same allocation. */
+    assert(reset_feed_pause_and_wait(0) && reset_feed_retain());
+    assert(s_retained.version == 6 && s_retained.checksum == rtc_checksum(&s_retained));
+    assert(view.data == &s_retained.data && view.data->stats.total == 42);
+    s_worker = NULL; s_cache_mutex = NULL; s_paused = false;
+    memset(&s_snapshot, 0, sizeof(s_snapshot));
+    assert(reset_feed_restore_retained());
+    reset_feed_get_snapshot(&view);
+    assert(view.data == &s_retained.data && view.has_data && view.stale && view.data->stats.total == 42);
+}
+
 int main(void)
 {
+    test_single_cache_and_reader_pin();
     test_fetch_and_cache();
     test_readiness_and_failure();
     test_limits_headers_and_status();

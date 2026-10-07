@@ -2,15 +2,16 @@
 #include "reset_feed.h"
 #include "reset_ui.h"
 #include "reset_settings.h"
-/* Pointer-free bounded reading selection. Captured when entering READING so
- * live refreshes and timezone changes cannot mix body, date and source. */
+/* Small reading selection referencing the service's pinned current cache.
+ * Capture only after rendering HOME, then pin revision before entering. */
 typedef struct {
     bool valid;
-    char text[257];
+    const char *text;
+    uint32_t revision;
     char type[48];
     char date[48];
     char zone[32];
-    char source_url[121];
+    char source_url[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
     bool source_original;
     bool truncated;
 } reset_reader_snapshot_t;

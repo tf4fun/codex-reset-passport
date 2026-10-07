@@ -26,7 +26,8 @@ bool reset_presenter_capture_reader(const reset_ui_model_t *model,
     if (!snapshot) return false;
     memset(snapshot, 0, sizeof(*snapshot));
     if (!model || !model->reading_available) return false;
-    snprintf(snapshot->text, sizeof(snapshot->text), "%s", model->announcement_text);
+    snapshot->text = model->announcement_text;
+    snapshot->revision = model->announcement_revision;
     snprintf(snapshot->type, sizeof(snapshot->type), "%s", model->announcement_type);
     snprintf(snapshot->date, sizeof(snapshot->date), "%s", model->announcement_date);
     snprintf(snapshot->zone, sizeof(snapshot->zone), "%s", model->zone);
@@ -42,7 +43,7 @@ bool reset_presenter_capture_reader(const reset_ui_model_t *model,
 static void select_record(reset_ui_model_t *out, const char *raw, const char *type,
                           int64_t announced_at, const char *source_url, bool observed,
                           bool truncated, int offset, const reset_presenter_state_t *state) {
-    snprintf(out->announcement_text, sizeof(out->announcement_text), "%s", raw[0] ? raw : "此公告未提供原文");
+    out->announcement_text = raw[0] ? raw : "此公告未提供原文";
     snprintf(out->announcement_type, sizeof(out->announcement_type), "%s", type);
     stamp(announced_at, offset, out->announcement_date, sizeof(out->announcement_date), false);
     relative(announced_at, state, out->announcement_age, sizeof(out->announcement_age));
@@ -62,13 +63,14 @@ void reset_presenter_build(const reset_feed_snapshot_t *feed,
     out->connected = state->connected;
     out->settings_editing = state->settings_editing;
     out->selected_setting = state->selected_setting;
-    out->reading_page = state->reading_page < 9 ? state->reading_page : 8;
+    out->reading_page = state->reading_page;
+    out->announcement_revision = feed->revision;
     if (state->battery >= 0 && state->battery <= 100)
         snprintf(out->battery, sizeof(out->battery), "%d%%", state->battery);
     SET(status, "最近一次 CODEX 额度重置");
     SET(hero, "--"); SET(date, "-- / --  --:--");
     SET(announcement_type, "暂无公告"); SET(announcement_age, "时间暂未公布");
-    SET(announcement_date, "-- / --  --:--"); SET(announcement_text, "暂无可显示的公告原文");
+    SET(announcement_date, "-- / --  --:--"); out->announcement_text = "暂无可显示的公告原文";
     SET(announcement_source_url, "https://codex-resets.com/zh-CN");
     SET(detail_type, "暂无重置记录"); SET(detail_source, "第三方汇总 · 非个人额度");
     SET(detail_generated, "--");
@@ -78,62 +80,63 @@ void reset_presenter_build(const reset_feed_snapshot_t *feed,
     out->forecast_confidence = -1;
     int offset = state->page == RESET_UI_TIMEZONE ? state->draft_utc_offset : state->settings.utc_offset_minutes;
     reset_settings_zone_label(offset, out->zone, sizeof(out->zone));
-    if (feed->has_data) {
-        stamp(feed->data.generated_at, 0, out->detail_generated, sizeof(out->detail_generated), true);
-        snprintf(out->stats_total, sizeof(out->stats_total), "%lu", (unsigned long)feed->data.stats.total);
-        if (feed->data.stats.has_avg_interval_days)
-            snprintf(out->stats_average, sizeof(out->stats_average), "%.1f", feed->data.stats.avg_interval_days);
-        if (feed->data.stats.has_days_since_last)
-            snprintf(out->stats_elapsed, sizeof(out->stats_elapsed), "%.1f", feed->data.stats.days_since_last);
-        if (feed->data.latest.present) {
+    if (feed->has_data && feed->data) {
+        stamp(feed->data->generated_at, 0, out->detail_generated, sizeof(out->detail_generated), true);
+        snprintf(out->stats_total, sizeof(out->stats_total), "%lu", (unsigned long)feed->data->stats.total);
+        if (feed->data->stats.has_avg_interval_days)
+            snprintf(out->stats_average, sizeof(out->stats_average), "%.1f", feed->data->stats.avg_interval_days);
+        if (feed->data->stats.has_days_since_last)
+            snprintf(out->stats_elapsed, sizeof(out->stats_elapsed), "%.1f", feed->data->stats.days_since_last);
+        if (feed->data->latest.present) {
             out->latest_available = true;
-            relative(feed->data.latest.announced_at, state, out->hero, sizeof(out->hero));
-            stamp(feed->data.latest.announced_at, offset, out->date, sizeof(out->date), true);
-            SET(detail_type, feed->data.latest.kind == RESET_KIND_BANKED ? "备用额度 · 已发放" : "常规重置 · 已执行");
-            SET(detail_source, feed->data.latest.observed ? "来源：站点观察" : "来源：站点收录公告");
-            if (feed->data.latest.kind == RESET_KIND_BANKED) SET(status, "最近一次备用额度发放");
+            relative(feed->data->latest.announced_at, state, out->hero, sizeof(out->hero));
+            stamp(feed->data->latest.announced_at, offset, out->date, sizeof(out->date), true);
+            SET(detail_type, feed->data->latest.kind == RESET_KIND_BANKED ? "备用额度 · 已发放" : "常规重置 · 已执行");
+            SET(detail_source, feed->data->latest.observed ? "来源：站点观察" : "来源：站点收录公告");
+            if (feed->data->latest.kind == RESET_KIND_BANKED) SET(status, "最近一次备用额度发放");
         }
         /* Presence determines priority, never relative announcement freshness. */
-        if (feed->data.scheduled.present) {
+        if (feed->data->scheduled.present) {
             out->primary_scheduled = out->has_notice = true;
             SET(next_title, "下一次重置");
-            SET(next_status, feed->data.scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 已计划" : "常规重置 · 已计划");
-            if (feed->data.scheduled.has_time) {
+            SET(next_status, feed->data->scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 已计划" : "常规重置 · 已计划");
+            if (feed->data->scheduled.has_time) {
                 out->next_has_time = true;
                 char when[32];
-                stamp(feed->data.scheduled.scheduled_for, offset, when, sizeof(when), true);
+                stamp(feed->data->scheduled.scheduled_for, offset, when, sizeof(when), true);
                 /* stamp has the fixed YYYY-MM-DD HH:MM format. */
                 snprintf(out->next_date, sizeof(out->next_date), "%.10s", when);
                 snprintf(out->next_time, sizeof(out->next_time), "%.5s", when + 11);
-                if (state->clock_ready && feed->data.scheduled.scheduled_for <= state->now)
-                    SET(next_status, feed->data.scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 等待确认" : "常规重置 · 等待确认");
+                if (state->clock_ready && feed->data->scheduled.scheduled_for <= state->now)
+                    SET(next_status, feed->data->scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 等待确认" : "常规重置 · 等待确认");
             }
             if (state->page == RESET_UI_HOME)
-                select_record(out, feed->data.scheduled.text,
-                              feed->data.scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 已计划" : "常规重置 · 已计划",
-                              feed->data.scheduled.announced_at, feed->data.scheduled.source_url,
-                              feed->data.scheduled.observed, feed->data.scheduled.text_truncated, offset, state);
-        } else if (feed->data.latest.present) {
-            SET(next_title, feed->data.latest.kind == RESET_KIND_BANKED ? "最近一次备用额度" : "最近一次重置");
+                select_record(out, feed->data->scheduled.text,
+                              feed->data->scheduled.kind == RESET_KIND_BANKED ? "备用额度 · 已计划" : "常规重置 · 已计划",
+                              feed->data->scheduled.announced_at, feed->data->scheduled.source_url,
+                              feed->data->scheduled.observed, feed->data->scheduled.text_truncated, offset, state);
+        } else if (feed->data->latest.present) {
+            SET(next_title, feed->data->latest.kind == RESET_KIND_BANKED ? "最近一次备用额度" : "最近一次重置");
             SET(next_status, out->detail_type);
             if (state->page == RESET_UI_HOME)
-                select_record(out, feed->data.latest.text, out->detail_type,
-                              feed->data.latest.announced_at, feed->data.latest.source_url,
-                              feed->data.latest.observed, feed->data.latest.text_truncated, offset, state);
+                select_record(out, feed->data->latest.text, out->detail_type,
+                              feed->data->latest.announced_at, feed->data->latest.source_url,
+                              feed->data->latest.observed, feed->data->latest.text_truncated, offset, state);
         }
         /* A watch remains a separate secondary prediction, even with a plan.
          * Expired/unverified-clock watches never become the primary record. */
-        if (feed->data.watch.present && state->clock_ready && feed->data.watch.expires_at > state->now) {
+        if (feed->data->watch.present && state->clock_ready && feed->data->watch.expires_at > state->now) {
             out->timing_is_forecast = true;
-            SET(next_body, feed->data.watch.forecast_window[0] ? feed->data.watch.forecast_window : "时间暂未公布");
-            out->next_truncated = feed->data.watch.forecast_window_truncated;
-            out->forecast_confidence = feed->data.watch.confidence_percent;
+            SET(next_body, feed->data->watch.forecast_window[0] ? feed->data->watch.forecast_window : "时间暂未公布");
+            out->next_truncated = feed->data->watch.forecast_window_truncated;
+            out->forecast_confidence = feed->data->watch.confidence_percent;
         }
     }
     /* The reader must never silently fall back to another live record. */
     if (state->page == RESET_UI_READING && state->reader_snapshot && state->reader_snapshot->valid) {
         const reset_reader_snapshot_t *saved = state->reader_snapshot;
-        SET(announcement_text, saved->text);
+        out->announcement_text = saved->text;
+        out->announcement_revision = saved->revision;
         SET(announcement_type, saved->type);
         SET(announcement_date, saved->date);
         SET(announcement_source_url, saved->source_url);

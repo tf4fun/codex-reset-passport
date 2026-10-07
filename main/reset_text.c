@@ -1,6 +1,11 @@
 #include "reset_text.h"
 #include <string.h>
 
+_Static_assert(RESET_TEXT_MAX_BYTES <= UINT16_MAX, "Page offsets must fit retained text");
+_Static_assert(RESET_TEXT_MAX_PAGES < UINT8_MAX, "Text pages plus source must fit the UI index");
+_Static_assert(RESET_TEXT_PAGE_CAPACITY > RESET_TEXT_READING_LINES * 5U,
+               "Each full page must make progress through seven UTF-8 codepoints");
+
 /* Strict bounded decoding is also a second defense against malformed callers.
  * Network parsing rejects invalid UTF-8 before this module is reached. */
 static size_t decode(const char *s, size_t available, uint32_t *cp) {
@@ -22,10 +27,11 @@ static size_t decode(const char *s, size_t available, uint32_t *cp) {
     return n;
 }
 static size_t sanitize(const char *input, size_t capacity, reset_text_advance_fn advance,
-                       void *context, char *out, bool *replaced, bool *truncated) {
+                       void *context, char *out, size_t max_bytes,
+                       bool *replaced, bool *truncated) {
     size_t i = 0, used = 0;
     if (!input) { out[0] = '\0'; return 0; }
-    const size_t limit = capacity < RESET_TEXT_MAX_BYTES ? capacity : RESET_TEXT_MAX_BYTES;
+    const size_t limit = capacity < max_bytes ? capacity : max_bytes;
     while (i < limit && input[i]) {
         uint32_t cp;
         size_t n = decode(input + i, limit - i, &cp);
@@ -62,13 +68,13 @@ static unsigned measure(const char *s, size_t size, reset_text_advance_fn advanc
 /* A line ends at whitespace if possible, otherwise at a complete codepoint.
  * Even one unbroken URL cannot escape its pixel/line budget. */
 static size_t line(const char *s, size_t length, reset_text_advance_fn advance,
-                   void *context, unsigned width, size_t *visible) {
+                   void *context, unsigned width, size_t max_bytes, size_t *visible) {
     size_t i = 0, fitted = 0, break_at = 0;
     while (i < length && s[i] != '\n') {
         uint32_t cp;
         size_t n = decode(s + i, length - i, &cp);
         if (!n) break;
-        if (measure(s, i + n, advance, context) > width) break;
+        if (i + n > max_bytes || measure(s, i + n, advance, context) > width) break;
         i += n;
         fitted = i;
         if (cp == ' ') break_at = i;
@@ -77,6 +83,7 @@ static size_t line(const char *s, size_t length, reset_text_advance_fn advance,
     if (!fitted && i < length && s[i] != '\n') {
         uint32_t cp;
         fitted = decode(s, length, &cp); /* Must progress even with impossible width. */
+        if (fitted > max_bytes) fitted = 0;
     }
     size_t consumed = fitted;
     *visible = fitted;
@@ -90,8 +97,10 @@ static size_t block(const char *input, size_t length, unsigned max_lines,
                     char *out, size_t capacity) {
     size_t consumed = 0, used = 0;
     for (unsigned row = 0; row < max_lines && consumed < length; ++row) {
+        if (used + (row ? 1U : 0U) + 1U >= capacity) break;
         size_t visible = 0;
-        size_t take = line(input + consumed, length - consumed, advance, context, width, &visible);
+        size_t take = line(input + consumed, length - consumed, advance, context, width,
+                           capacity - used - (row ? 1U : 0U) - 1U, &visible);
         if (!take || used + visible + (row ? 1U : 0U) >= capacity) break;
         if (row) out[used++] = '\n';
         memcpy(out + used, input + consumed, visible);
@@ -117,9 +126,11 @@ void reset_text_layout(const char *input, size_t capacity, bool source_truncated
                        reset_text_advance_fn advance, void *context,
                        unsigned width, reset_text_layout_t *out) {
     memset(out, 0, sizeof(*out));
+    out->input = input;
+    out->input_capacity = capacity;
     out->source_truncated = source_truncated;
-    char clean[RESET_TEXT_MAX_BYTES + 1];
-    size_t length = sanitize(input, capacity, advance, context, clean,
+    char clean[RESET_TEXT_MAX_BYTES + 1U];
+    size_t length = sanitize(input, capacity, advance, context, clean, RESET_TEXT_MAX_BYTES,
                              &out->glyph_substituted, &out->source_truncated);
     if (!advance || !width) { out->page_count = 1; out->page_limit_reached = length > 0; return; }
     size_t summary = block(clean, length, RESET_TEXT_SUMMARY_LINES, advance, context,
@@ -127,23 +138,40 @@ void reset_text_layout(const char *input, size_t capacity, bool source_truncated
     out->summary_shortened = summary < length || out->source_truncated;
     if (out->summary_shortened) ellipsis(out->summary, sizeof(out->summary), advance, context, width);
     size_t consumed = 0;
+    char page[RESET_TEXT_PAGE_CAPACITY];
     do {
         consumed += block(clean + consumed, length - consumed, RESET_TEXT_READING_LINES,
-                          advance, context, width, out->pages[out->page_count],
-                          sizeof(out->pages[0]));
+                          advance, context, width, page, sizeof(page));
         ++out->page_count;
+        out->page_offsets[out->page_count] = (uint16_t)consumed;
     } while (consumed < length && out->page_count < RESET_TEXT_MAX_PAGES);
     out->page_limit_reached = consumed < length;
-    if (out->page_limit_reached || out->source_truncated)
-        ellipsis(out->pages[out->page_count - 1], sizeof(out->pages[0]), advance, context, width);
+}
+void reset_text_page(const reset_text_layout_t *layout, unsigned page,
+                     reset_text_advance_fn advance, void *context, unsigned width,
+                     char out[RESET_TEXT_PAGE_CAPACITY]) {
+    out[0] = '\0';
+    if (!layout || page >= layout->page_count || !advance || !width) return;
+    char clean[RESET_TEXT_MAX_BYTES + 1U];
+    bool replaced = false, truncated = false;
+    size_t length = sanitize(layout->input, layout->input_capacity, advance, context,
+                             clean, RESET_TEXT_MAX_BYTES, &replaced, &truncated);
+    size_t begin = layout->page_offsets[page];
+    size_t end = layout->page_offsets[page + 1U];
+    if (end < begin || end > length) return;
+    block(clean + begin, end - begin, RESET_TEXT_READING_LINES,
+          advance, context, width, out, RESET_TEXT_PAGE_CAPACITY);
+    if (page + 1U == layout->page_count && (layout->page_limit_reached || layout->source_truncated))
+        ellipsis(out, RESET_TEXT_PAGE_CAPACITY, advance, context, width);
 }
 bool reset_text_fit(const char *input, size_t capacity, unsigned max_lines,
                     reset_text_advance_fn advance, void *context, unsigned width,
                     char *out, size_t out_capacity) {
     if (!out_capacity) return true;
-    char clean[RESET_TEXT_MAX_BYTES + 1];
+    char clean[RESET_TEXT_FIT_MAX_BYTES + 1U];
     bool replaced = false, truncated = false;
-    size_t length = sanitize(input, capacity, advance, context, clean, &replaced, &truncated);
+    size_t length = sanitize(input, capacity, advance, context, clean, RESET_TEXT_FIT_MAX_BYTES,
+                             &replaced, &truncated);
     if (!advance || !width) { out[0] = '\0'; return true; }
     size_t consumed = block(clean, length, max_lines, advance, context, width, out, out_capacity);
     if (consumed < length || truncated) ellipsis(out, out_capacity, advance, context, width);

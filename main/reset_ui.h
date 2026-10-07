@@ -13,7 +13,8 @@ typedef struct {
     char battery[12];
     char status[48];
     char hero[48];
-    char announcement_text[257];
+    const char *announcement_text;
+    uint32_t announcement_revision;
     char announcement_type[48];
     char announcement_age[48];
     char announcement_date[48];

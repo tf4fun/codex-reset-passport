@@ -387,9 +387,13 @@ static bool parse_stats(const cJSON *object, reset_stats_t *out)
                          &out->avg_interval_days);
 }
 
-bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out)
+/* NULL out validates an in-flight response deferred by a pinned reader. The
+ * temporary candidate is released before returning; no second cache survives. */
+static bool parse_status(const char *json, size_t length, int64_t generated_ceiling,
+                         reset_feed_data_t *out,
+                         void (*publish)(const reset_feed_data_t *))
 {
-    if (!json || !out || length == 0 || length > RESET_FEED_BODY_LIMIT ||
+    if (!json || length == 0 || length > RESET_FEED_BODY_LIMIT ||
         !json_preflight(json, length)) return false;
     const char *end = NULL;
     cJSON *root = cJSON_ParseWithLengthOpts(json, length, &end, false);
@@ -406,7 +410,8 @@ bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out)
             parse_latest(field(data, "latest_reset"), &candidate.latest) &&
             parse_schedule(field(data, "scheduled_reset"), &candidate.scheduled) &&
             parse_watch(field(data, "active_watch"), &candidate.watch);
-    valid = valid && (!candidate.stats.has_last_reset_at ||
+    valid = valid && candidate.generated_at <= generated_ceiling &&
+            (!candidate.stats.has_last_reset_at ||
                       candidate.stats.last_reset_at <= candidate.generated_at + 300) &&
             (!candidate.latest.present ||
                       candidate.latest.announced_at <= candidate.generated_at + 300) &&
@@ -415,8 +420,14 @@ bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out)
             (!candidate.watch.present ||
              candidate.watch.observed_at <= candidate.generated_at + 300);
     cJSON_Delete(root);
-    if (valid) *out = candidate;
+    if (valid && publish) publish(&candidate);
+    else if (valid && out) *out = candidate;
     return valid;
+}
+
+bool reset_feed_parse(const char *json, size_t length, reset_feed_data_t *out)
+{
+    return out && parse_status(json, length, INT64_MAX, out, NULL);
 }
 
 static uint64_t history_hash(const char *text)
@@ -659,10 +670,12 @@ void reset_feed_poll_complete(reset_feed_poll_t *poll, uint64_t now_ms,
 #include <time.h>
 
 #include "esp_crt_bundle.h"
+#include "esp_attr.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #define RESET_HTTP_TIMEOUT_MS 8000
 #define RESET_HTTP_TOTAL_MS UINT64_C(30000)
@@ -673,6 +686,12 @@ void reset_feed_poll_complete(reset_feed_poll_t *poll, uint64_t now_ms,
 #endif
 
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t s_cache_mutex;
+static bool s_reader_pinned;
+static bool s_reader_refresh_due;
+/* The live cache IS the retained cache. Only policy/checksum fields are filled
+ * when sleeping; neither UI views nor RTC handoff copy original text. */
+static RTC_DATA_ATTR reset_feed_rtc_state_t s_retained;
 static TaskHandle_t s_worker;
 static bool s_starting;
 static bool s_wifi_ready;
@@ -691,7 +710,7 @@ static bool s_cache_needs_verification;
 static bool s_restore_pending;
 static int64_t s_restore_hard_backoff_at;
 static int64_t s_restore_next_auto_at;
-static reset_feed_snapshot_t s_snapshot;
+static reset_feed_snapshot_t s_snapshot = {.data = &s_retained.data};
 static reset_feed_poll_t s_poll;
 static uint64_t s_last_checked_ms;
 /* Only the worker uses the ETag, except pre-start RTC import clearing it. */
@@ -708,9 +727,30 @@ typedef struct {
     reset_feed_error_t error;
     int http_status;
     bool unchanged;
-    reset_feed_data_t data;
+    bool deferred;
     response_headers_t headers;
 } response_t;
+
+static bool cache_lock(uint32_t timeout_ms)
+{
+    /* Before start there is no writer, including a failed service startup. */
+    return !s_cache_mutex || xSemaphoreTake(s_cache_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+static void cache_unlock(void)
+{
+    if (s_cache_mutex) xSemaphoreGive(s_cache_mutex);
+}
+
+/* Called after complete validation, while holding the cache mutex. */
+static void publish_current(const reset_feed_data_t *data)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_retained.data = *data;
+    ++s_snapshot.revision;
+    s_snapshot.has_data = true;
+    taskEXIT_CRITICAL(&s_lock);
+}
 
 static uint64_t monotonic_ms(void)
 {
@@ -865,13 +905,23 @@ static void fetch_http(response_t *response, const char *url, bool conditional,
     esp_http_client_cleanup(client);
     client = NULL;
     if (!request_timeout(started)) goto cleanup;
-    bool parsed = history ? reset_history_parse_page(history, body, used) :
-                            reset_feed_parse(body, used, &response->data);
-    response->error = parsed ? RESET_FEED_ERROR_NONE : RESET_FEED_ERROR_FORMAT;
-    if (!history && response->error == RESET_FEED_ERROR_NONE &&
-        response->data.generated_at > (int64_t)time(NULL) + 600) {
-        response->error = RESET_FEED_ERROR_FORMAT;
+    bool parsed;
+    if (history) parsed = reset_history_parse_page(history, body, used);
+    else {
+        /* TLS is already freed. Validation uses a temporary parser frame, then
+         * publishes into the sole cache under its mutex. A reader pin cannot
+         * race this publication; rejected/future payloads leave cache intact. */
+        timeout = request_timeout(started);
+        if (!timeout || !cache_lock((uint32_t)timeout)) goto cleanup;
+        if (!request_timeout(started)) { cache_unlock(); goto cleanup; }
+        taskENTER_CRITICAL(&s_lock);
+        response->deferred = s_reader_pinned;
+        taskEXIT_CRITICAL(&s_lock);
+        parsed = parse_status(body, used, (int64_t)time(NULL) + 600, NULL,
+                              response->deferred ? NULL : publish_current);
+        cache_unlock();
     }
+    response->error = parsed ? RESET_FEED_ERROR_NONE : RESET_FEED_ERROR_FORMAT;
 cleanup:
     free(body);
     if (client) esp_http_client_cleanup(client);
@@ -908,12 +958,14 @@ static void apply_response(const response_t *response, uint64_t now_ms, int64_t 
     taskENTER_CRITICAL(&s_lock);
     bool success = response->error == RESET_FEED_ERROR_NONE &&
                    (!response->unchanged || s_snapshot.has_data);
-    if (success) {
+    if (success && response->deferred) {
+        s_reader_refresh_due = true;
+        s_cache_needs_verification = true;
+    } else if (success) {
         /* Never associate an invalid payload's ETag with good cache. */
         if (!response->unchanged || response->headers.etag[0]) {
             memcpy(s_etag, response->headers.etag, sizeof(s_etag));
         }
-        if (!response->unchanged) s_snapshot.data = response->data;
         s_snapshot.has_data = true;
         s_snapshot.last_checked_at = wall_now;
         s_last_checked_ms = now_ms;
@@ -923,7 +975,7 @@ static void apply_response(const response_t *response, uint64_t now_ms, int64_t 
                        response->error == RESET_FEED_ERROR_NONE ? RESET_FEED_ERROR_HTTP : response->error;
     s_snapshot.http_status = response->http_status;
     s_fetching = false;
-    s_refresh_pending = false;
+    s_refresh_pending = success && response->deferred && !s_reader_pinned;
     reset_feed_poll_complete(&s_poll, now_ms, success, response->headers.retry_after);
     taskEXIT_CRITICAL(&s_lock);
 }
@@ -963,8 +1015,8 @@ static bool history_fresh_locked(int64_t wall_now)
            wall_now - s_history.last_checked_at < RESET_HISTORY_FRESH_SECONDS &&
            s_history.data.start_day == reset_history_window_start(wall_now) &&
            s_history.data.through_at / INT64_C(86400) == wall_now / INT64_C(86400) &&
-           (!s_snapshot.has_data || !s_snapshot.data.latest.present ||
-            s_snapshot.data.latest.announced_at <= s_history.data.through_at);
+           (!s_snapshot.has_data || !s_retained.data.latest.present ||
+            s_retained.data.latest.announced_at <= s_history.data.through_at);
 }
 
 static uint64_t remaining_ms(uint64_t deadline, uint64_t now)
@@ -1010,7 +1062,7 @@ static reset_feed_block_t refresh_block_locked(uint64_t now, int64_t wall_now)
     if (!s_clock_ready || wall_now < INT64_C(1704067200) || s_restore_pending) {
         return RESET_FEED_BLOCK_CLOCK;
     }
-    if (s_fetching) return RESET_FEED_BLOCK_BUSY;
+    if (s_fetching || s_reader_pinned) return RESET_FEED_BLOCK_BUSY;
     if (now < s_poll.hard_backoff_until_ms) return RESET_FEED_BLOCK_BACKOFF;
     if (now < s_poll.debounce_until_ms) return RESET_FEED_BLOCK_DEBOUNCE;
     if (s_refresh_pending) return RESET_FEED_BLOCK_BUSY;
@@ -1024,7 +1076,7 @@ static bool admit_fetch(uint64_t now, int64_t wall_now)
     bool due = false;
     taskENTER_CRITICAL(&s_lock);
     restore_policy_locked(now, wall_now);
-    if (!s_paused && !s_fetching && s_wifi_ready && s_clock_ready &&
+    if (!s_paused && !s_fetching && !s_reader_pinned && s_wifi_ready && s_clock_ready &&
         wall_now >= INT64_C(1704067200) && !s_restore_pending &&
         (s_refresh_pending ? reset_feed_poll_manual_due(&s_poll, now) :
                              reset_feed_poll_due(&s_poll, now))) {
@@ -1101,6 +1153,15 @@ esp_err_t reset_feed_start(void)
     }
     s_starting = true;
     taskEXIT_CRITICAL(&s_lock);
+    if (!s_cache_mutex) s_cache_mutex = xSemaphoreCreateMutex();
+    if (!s_cache_mutex) {
+        taskENTER_CRITICAL(&s_lock);
+        s_starting = false;
+        s_snapshot.error = RESET_FEED_ERROR_MEMORY;
+        taskEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    if (!s_snapshot.has_data) memset(&s_retained.data, 0, sizeof(s_retained.data));
     TaskHandle_t worker = NULL;
     /* Match IDF's HTTPS-client example budget for TLS certificate validation. */
     BaseType_t result = xTaskCreate(feed_worker, "reset_feed", 8192, NULL, 4, &worker);
@@ -1224,6 +1285,41 @@ void reset_feed_get_snapshot(reset_feed_snapshot_t *out)
     taskEXIT_CRITICAL(&s_lock);
 }
 
+bool reset_feed_lock_snapshot(reset_feed_snapshot_t *out, uint32_t timeout_ms)
+{
+    if (!out || !cache_lock(timeout_ms)) return false;
+    reset_feed_get_snapshot(out);
+    return true;
+}
+
+void reset_feed_unlock_snapshot(void)
+{
+    cache_unlock();
+}
+
+bool reset_feed_pin_reader(uint32_t revision)
+{
+    if (!cache_lock(0)) return false;
+    taskENTER_CRITICAL(&s_lock);
+    bool valid = s_snapshot.has_data && s_snapshot.revision == revision;
+    if (valid) s_reader_pinned = true;
+    taskEXIT_CRITICAL(&s_lock);
+    cache_unlock();
+    return valid;
+}
+
+void reset_feed_unpin_reader(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_reader_pinned = false;
+    if (s_reader_refresh_due) s_refresh_pending = true;
+    bool notify = s_reader_refresh_due;
+    s_reader_refresh_due = false;
+    TaskHandle_t worker = s_worker;
+    taskEXIT_CRITICAL(&s_lock);
+    if (notify && worker) xTaskNotifyGive(worker);
+}
+
 bool reset_feed_set_auto_interval(uint32_t minutes)
 {
     if (!reset_feed_interval_valid(minutes)) return false;
@@ -1282,9 +1378,9 @@ void reset_feed_resume(bool refresh_now)
 }
 
 #define RESET_RTC_MAGIC UINT32_C(0x52534632)
-/* Version 5 retains the independently validated complete history cache.
+/* Version 6 expands retained original text while keeping the history cache.
  * Both this version and sizeof check reject older cache layouts on wake. */
-#define RESET_RTC_VERSION 5U
+#define RESET_RTC_VERSION 6U
 
 static uint32_t rtc_checksum(const reset_feed_rtc_state_t *state)
 {
@@ -1320,47 +1416,49 @@ bool reset_feed_export_rtc(reset_feed_rtc_state_t *out)
     if (!out) return false;
     uint64_t now = monotonic_ms();
     int64_t wall_now = (int64_t)time(NULL);
-    reset_feed_rtc_state_t state = {0};
     taskENTER_CRITICAL(&s_lock);
     if (!s_paused || s_fetching || s_starting) {
         taskEXIT_CRITICAL(&s_lock);
         return false;
     }
-    state.magic = RESET_RTC_MAGIC;
-    state.version = RESET_RTC_VERSION;
-    state.size = sizeof(state);
-    state.data = s_snapshot.data;
-    state.has_data = s_snapshot.has_data;
-    state.failures = s_poll.failures;
-    state.auto_interval_minutes = (uint32_t)(automatic_interval_ms(&s_poll) / 60000);
-    state.error = s_snapshot.error;
-    state.http_status = s_snapshot.http_status;
-    state.last_checked_at = s_snapshot.last_checked_at;
-    state.last_attempt_at = s_snapshot.last_attempt_at;
-    state.history = s_history.data;
-    state.has_history = s_history.has_data;
-    state.history_error = s_history.error;
-    state.history_http_status = s_history.http_status;
-    state.history_last_checked_at = s_history.last_checked_at;
+    /* Keep the live data in place when exporting to its own RTC storage. */
+    memset(out, 0, offsetof(reset_feed_rtc_state_t, data));
+    memset((char *)out + offsetof(reset_feed_rtc_state_t, has_data), 0,
+           sizeof(*out) - offsetof(reset_feed_rtc_state_t, has_data));
+    if (out != &s_retained) out->data = s_retained.data;
+    out->magic = RESET_RTC_MAGIC;
+    out->version = RESET_RTC_VERSION;
+    out->size = sizeof(*out);
+    out->has_data = s_snapshot.has_data;
+    out->failures = s_poll.failures;
+    out->auto_interval_minutes = (uint32_t)(automatic_interval_ms(&s_poll) / 60000);
+    out->error = s_snapshot.error;
+    out->http_status = s_snapshot.http_status;
+    out->last_checked_at = s_snapshot.last_checked_at;
+    out->last_attempt_at = s_snapshot.last_attempt_at;
+    out->history = s_history.data;
+    out->has_history = s_history.has_data;
+    out->history_error = s_history.error;
+    out->history_http_status = s_history.http_status;
+    out->history_last_checked_at = s_history.last_checked_at;
     if (s_restore_pending) {
-        state.hard_backoff_until = s_restore_hard_backoff_at;
-        state.next_auto_at = s_restore_next_auto_at;
+        out->hard_backoff_until = s_restore_hard_backoff_at;
+        out->next_auto_at = s_restore_next_auto_at;
     } else if (wall_now >= INT64_C(1704067200)) {
         uint64_t remaining = remaining_ms(s_poll.hard_backoff_until_ms, now);
-        state.hard_backoff_until = remaining ? epoch_after_ms(wall_now, remaining) : 0;
-        state.next_auto_at = epoch_after_ms(wall_now, remaining_ms(s_poll.next_attempt_ms, now));
+        out->hard_backoff_until = remaining ? epoch_after_ms(wall_now, remaining) : 0;
+        out->next_auto_at = epoch_after_ms(wall_now, remaining_ms(s_poll.next_attempt_ms, now));
         /* Preserve the fractional-second debounce conservatively and also
          * survive a wall-clock correction since the attempt began. */
         remaining = remaining_ms(s_poll.debounce_until_ms, now);
         if (remaining) {
             int64_t conservative_attempt = epoch_after_ms(wall_now, remaining) -
                                            (int64_t)(RESET_FEED_MANUAL_DEBOUNCE_MS / 1000);
-            if (conservative_attempt > state.last_attempt_at) state.last_attempt_at = conservative_attempt;
+            if (conservative_attempt > out->last_attempt_at) out->last_attempt_at = conservative_attempt;
         }
     }
     taskEXIT_CRITICAL(&s_lock);
-    state.checksum = rtc_checksum(&state);
-    memcpy(out, &state, sizeof(state));
+    out->checksum = rtc_checksum(out);
     return true;
 }
 
@@ -1395,7 +1493,9 @@ bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state)
         return false;
     }
     memset(&s_snapshot, 0, sizeof(s_snapshot));
-    s_snapshot.data = state->data;
+    if (state != &s_retained) s_retained.data = state->data;
+    s_snapshot.data = &s_retained.data;
+    s_snapshot.revision = 1;
     s_snapshot.has_data = state->has_data != 0;
     s_snapshot.error = (reset_feed_error_t)state->error;
     s_snapshot.http_status = state->http_status;
@@ -1421,5 +1521,15 @@ bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state)
     s_etag[0] = 0; /* Cache is semantic only: force full revalidation on wake. */
     taskEXIT_CRITICAL(&s_lock);
     return true;
+}
+
+bool reset_feed_restore_retained(void)
+{
+    return reset_feed_import_rtc(&s_retained);
+}
+
+bool reset_feed_retain(void)
+{
+    return reset_feed_export_rtc(&s_retained);
 }
 #endif

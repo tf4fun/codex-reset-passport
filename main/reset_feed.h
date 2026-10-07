@@ -4,10 +4,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "reset_history.h"
+#include "reset_text_limits.h"
 
 #define RESET_FEED_URL "https://codex-resets.com/api/v1/status"
 #define RESET_FEED_BODY_LIMIT (16U * 1024U)
-#define RESET_FEED_TEXT_MAX_BYTES 256U
+#define RESET_FEED_TEXT_MAX_BYTES RESET_TEXT_MAX_BYTES
 #define RESET_FEED_FORECAST_MAX_BYTES 96U
 #define RESET_FEED_SOURCE_URL_MAX_BYTES 120U
 /* Client policy, not a published upstream rate limit. */
@@ -40,8 +41,9 @@ typedef struct {
      * a destination. QR capacity may impose a smaller limit in the UI. */
     char source_url[RESET_FEED_SOURCE_URL_MAX_BYTES + 1U];
     /* Original valid UTF-8, never a translation or executable instruction.
-     * Always NUL-terminated at a complete codepoint boundary. At most 256 bytes
-     * survive; text_truncated requires an explicit excerpt indicator in the UI.
+     * Always NUL-terminated at a complete codepoint boundary. At most
+     * RESET_FEED_TEXT_MAX_BYTES survive; text_truncated requires an explicit
+     * excerpt indicator in the UI.
      * ASCII controls other than LF/CR/TAB reject the response, including DEL.
      * text_has_non_ascii is advisory, NOT a guarantee of font glyph coverage:
      * the UI must check every codepoint, safely substitute missing glyphs and
@@ -129,7 +131,10 @@ typedef enum {
 } reset_feed_block_t;
 
 typedef struct {
-    reset_feed_data_t data;
+    /* Borrowed current cache. Firmware readers must hold lock_snapshot until
+     * they finish accessing it; pin_reader keeps its revision while reading. */
+    const reset_feed_data_t *data;
+    uint32_t revision;
     bool has_data;
     bool stale;                 /* Last verification older than 15 minutes. */
     reset_feed_status_t status;
@@ -194,7 +199,7 @@ void reset_feed_poll_complete(reset_feed_poll_t *poll, uint64_t now_ms,
 
 /* Retain this pointer-free, UTC-based value in RTC_DATA_ATTR storage. Import
  * only after an actual deep-sleep reset; cold boot must ignore RTC contents.
- * Version 5 adds the small complete history cache; version/size/checksum reject old,
+ * Version 6 expands original-text storage; version/size/checksum reject old,
  * corrupt or incompatible snapshots. No secrets,
  * ETag, heap pointer, RTOS handle, or boot-relative clock is retained. */
 typedef struct {
@@ -223,7 +228,7 @@ typedef struct {
 #include "esp_err.h"
 
 /* Call start once in application startup. The persistent task never touches
- * LVGL; snapshots are copied under a lock. No credentials or feed persist in
+ * LVGL; views share the sole RTC cache under a mutex. No credentials or feed persist in
  * flash. HTTPS uses the IDF CA bundle, hostname verification, and no redirects.
  * Requires json, esp_http_client, mbedtls and esp_timer components. */
 esp_err_t reset_feed_start(void);
@@ -236,7 +241,20 @@ void reset_feed_set_ready(bool wifi_connected, bool time_synchronized);
  * readiness, the 30s attempt debounce, or failure/Retry-After backoff. Snapshot
  * refresh_block explains a rejection. Accepted requests are coalesced. */
 bool reset_feed_request_refresh(void);
+/* Copies small status metadata only. Access data through lock_snapshot, or
+ * while its revision is pinned; the borrowed cache can otherwise change. */
 void reset_feed_get_snapshot(reset_feed_snapshot_t *out);
+/* Worker and UI share one cache, including its RTC storage. Do not retain a
+ * data view across unlock unless pin_reader succeeded for that revision.
+ * Acquire before the LVGL lock; the feed worker never acquires LVGL. */
+bool reset_feed_lock_snapshot(reset_feed_snapshot_t *out, uint32_t timeout_ms);
+void reset_feed_unlock_snapshot(void);
+/* Pin the last rendered revision atomically. A mismatched revision returns
+ * false so HOME refreshes before opening; no old body copy is kept. While
+ * pinned, status fetches wait and an already-in-flight response cannot replace
+ * the cache or its ETag. Unpin retries any deferred response with normal limits. */
+bool reset_feed_pin_reader(uint32_t revision);
+void reset_feed_unpin_reader(void);
 
 /* Nonblocking, lazy history request on page entry or OK; coalesced and
  * throttled to six hours after success. Shares the existing worker, transport
@@ -262,4 +280,8 @@ void reset_feed_resume(bool refresh_now);
  * Wake refresh waits for Wi-Fi + SNTP and preserves UTC backoff/debounce. */
 bool reset_feed_export_rtc(reset_feed_rtc_state_t *out);
 bool reset_feed_import_rtc(const reset_feed_rtc_state_t *state);
+/* Application uses the service-owned cache in place, without a second RTC or
+ * task-stack copy. Restore only after a real deep-sleep reset, before start. */
+bool reset_feed_restore_retained(void);
+bool reset_feed_retain(void);
 #endif

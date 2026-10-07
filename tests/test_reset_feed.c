@@ -143,7 +143,9 @@ static void test_announcement_text(void)
             assert((r ? data.scheduled.text_has_non_ascii : data.latest.text_has_non_ascii) == (i == 3));
         }
         char long_text[4097];
-        const size_t lengths[] = {255, 256, 257, sizeof(long_text) - 1};
+        const size_t lengths[] = {255, 256, 257, 280, RESET_FEED_TEXT_MAX_BYTES - 1,
+                                 RESET_FEED_TEXT_MAX_BYTES, RESET_FEED_TEXT_MAX_BYTES + 1,
+                                 sizeof(long_text) - 1};
         for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
             memset(long_text, 'a', lengths[i]);
             long_text[lengths[i]] = '\0';
@@ -155,6 +157,18 @@ static void test_announcement_text(void)
             assert(memcmp(retained, long_text, expected) == 0);
             assert((r ? data.scheduled.text_truncated : data.latest.text_truncated) ==
                    (lengths[i] > RESET_FEED_TEXT_MAX_BYTES));
+        }
+        /* A full 280-codepoint body survives for Latin, CJK and four-byte emoji.
+         * Byte capacity is shared by parser, presenter and reader, not 280 bytes. */
+        const char *characters[] = {"W", "中", "😀"};
+        for (size_t i = 0; i < sizeof(characters) / sizeof(characters[0]); ++i) {
+            size_t width = strlen(characters[i]);
+            for (unsigned cp = 0; cp < 280; ++cp) memcpy(long_text + cp * width, characters[i], width);
+            long_text[280 * width] = '\0';
+            cJSON_ReplaceItemInObjectCaseSensitive(record, "text", cJSON_CreateString(long_text));
+            assert(parse_tree(root, &data));
+            assert(!strcmp(r ? data.scheduled.text : data.latest.text, long_text));
+            assert(!(r ? data.scheduled.text_truncated : data.latest.text_truncated));
         }
         /* Every possible cut inside two-, three- and four-byte codepoints. */
         const char *codepoints[] = {"\xc3\xa9", "\xe9\x87\x8d", "\xf0\x9f\x98\x80"};

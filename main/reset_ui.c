@@ -11,6 +11,7 @@ LV_FONT_DECLARE(reset_font_16);
 LV_FONT_DECLARE(reset_font_12);
 LV_FONT_DECLARE(reset_font_24);
 static reset_text_layout_t announcement;
+static char reading_text[RESET_TEXT_PAGE_CAPACITY];
 static char next_text[272], reading_meta[96], reading_number[16];
 static char latest_heading[80], future_heading[80], forecast_input[160];
 static char reading_notice[72];
@@ -427,7 +428,7 @@ void reset_ui_update(const reset_ui_model_t *m) {
         snprintf(number, sizeof(number), "%u/4", (unsigned)m->page + 1);
         label(192, 52, 30, number, &lv_font_montserrat_12, MUTED);
     }
-    reset_text_layout(m->announcement_text, sizeof(m->announcement_text), m->announcement_truncated,
+    reset_text_layout(m->announcement_text, RESET_FEED_TEXT_MAX_BYTES + 1U, m->announcement_truncated,
                       font_advance, (void *)&reset_font_16, RESET_TEXT_WIDTH, &announcement);
     if (m->page == RESET_UI_HOME) {
         title("重置概览");
@@ -478,7 +479,7 @@ void reset_ui_update(const reset_ui_model_t *m) {
     } else if (m->page == RESET_UI_READING) {
         unsigned page = m->reading_page < reset_ui_reading_page_count() ? m->reading_page : announcement.page_count;
         snprintf(reading_number, sizeof(reading_number), "%u/%u", page + 1U, reset_ui_reading_page_count());
-        label(186, 54, 36, reading_number, &lv_font_montserrat_12, MUTED);
+        label(169, 54, 53, reading_number, &lv_font_montserrat_12, MUTED);
         if (page == announcement.page_count) {
             source_page(m);
             footer("上下翻页 · 确认返回", false);
@@ -487,11 +488,12 @@ void reset_ui_update(const reset_ui_model_t *m) {
         title("公告原文");
         snprintf(reading_meta, sizeof(reading_meta), "%.47s  %.31s", m->announcement_date, m->zone);
         small(24, 83, 192, reading_meta, MUTED);
-        text(30, 107, 178, announcement.pages[page], INK);
+        reset_text_page(&announcement, page, font_advance, (void *)&reset_font_16,
+                        RESET_TEXT_WIDTH, reading_text);
+        text(30, 107, 178, reading_text, INK);
         snprintf(reading_notice, sizeof(reading_notice), "%s", announcement.glyph_substituted &&
                  (announcement.source_truncated || announcement.page_limit_reached) ? "原文有截断 · 部分字形已替换" :
-                 announcement.page_limit_reached ? "已达八页上限 · 请查看站点" :
-                 announcement.source_truncated ? "仅保留前256字节 · 请查看站点" :
+                 (announcement.page_limit_reached || announcement.source_truncated) ? "原文有截断 · 请查看站点" :
                  announcement.glyph_substituted ? "部分字形已替换为 ?" : "");
         if (reading_notice[0]) small(24, 275, 192, reading_notice, ALERT);
         small(24, 295, 192, "Codex Resets", MUTED);

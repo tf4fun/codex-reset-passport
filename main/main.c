@@ -29,7 +29,6 @@ static const char *TAG = "reset_observer";
 typedef struct { bsp_btn_t button; bsp_btn_ev_t event; uint64_t at_ms; } input_t;
 static QueueHandle_t input_queue;
 static atomic_bool clock_ready, input_ready, input_overflow;
-static RTC_DATA_ATTR reset_feed_rtc_state_t rtc_feed;
 static RTC_DATA_ATTR uint32_t rtc_magic;
 /* Preserve darkness only over our own controlled automatic-shutdown restart. */
 static RTC_NOINIT_ATTR uint32_t rtc_dark_restart;
@@ -72,7 +71,7 @@ void app_main(void) {
     esp_err_t settings_error = reset_settings_load(&settings);
     bool restored = false;
     if (esp_reset_reason() == ESP_RST_DEEPSLEEP && rtc_magic == RTC_MAGIC)
-        restored = reset_feed_import_rtc(&rtc_feed);
+        restored = reset_feed_restore_retained();
     rtc_magic = 0; /* A controlled restart must never automatically re-enter sleep. */
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
         ESP_LOGE(TAG, "Display initialization failed"); return;
@@ -205,8 +204,10 @@ void app_main(void) {
                     /* Snapshot was captured only after a successful HOME render.
                      * Even a failed LVGL lock or a newer feed cannot change the
                      * record behind the visible time. No empty reader entry. */
-                    if (reset_controls_admit_reader(&controls, displayed_page, reader_snapshot.valid))
-                        reading_page = 0;
+                    if (reset_controls_admit_reader(&controls, displayed_page, reader_snapshot.valid)) {
+                        if (reset_feed_pin_reader(reader_snapshot.revision)) reading_page = 0;
+                        else controls.page = RESET_UI_HOME;
+                    }
                     break;
                 case RESET_ACTION_READING_PREVIOUS:
                     reading_page = (reading_page + reading_page_count - 1) % reading_page_count;
@@ -360,7 +361,7 @@ void app_main(void) {
                 idle_screen = (reset_idle_screen_t){0};
                 rtc_dark_restart = 0;
             }
-            if (prepare == ESP_OK && !late_input && reset_feed_export_rtc(&rtc_feed)) {
+            if (prepare == ESP_OK && !late_input && reset_feed_retain()) {
                 rtc_magic = RTC_MAGIC;
                 (void)reset_power_enter_deep_sleep(); /* Only pre-terminal errors return. */
                 if (automatic_sleep && bsp_button_deep_sleep_had_activity()) {
@@ -383,43 +384,47 @@ void app_main(void) {
             backlight = settings.brightness;
         if (backlight != applied_brightness) { bsp_display_backlight(backlight); applied_brightness = backlight; }
         reset_feed_set_ready(settings.wifi_enabled && wifi.connected && !wifi.provisioning && !wifi.suspended, atomic_load(&clock_ready));
-        static reset_feed_snapshot_t feed; /* Main-owner snapshot, not a large task-stack frame. */
-        reset_feed_get_snapshot(&feed);
+        if (controls.page != RESET_UI_READING) reset_feed_unpin_reader();
+        reset_feed_snapshot_t feed; /* Metadata and a borrowed view of the sole cache. */
+        bool feed_locked = reset_feed_lock_snapshot(&feed, 100);
         static reset_history_snapshot_t history;
         reset_feed_get_history_snapshot(&history);
         if (now_ms >= next_battery && !sleep_phase && !hold.active) { battery = bsp_battery_soc(); next_battery = now_ms + 60000; }
-        reset_presenter_state_t state = {
-            .page = controls.page, .history = &history, .connected = wifi.connected, .has_credentials = wifi.has_credentials,
-            .provisioning = wifi.provisioning, .wifi_error = wifi.state == RESET_WIFI_ERROR,
-            .wifi_initialized = wifi.initialized, .wifi_connecting = wifi.state == RESET_WIFI_CONNECTING,
-            .wifi_attempts = wifi.attempts, .wifi_disconnect_reason = wifi.disconnect_reason,
-            .wifi_last_error = wifi.last_error, .wifi_persistence_error = wifi.persistence_error,
-            .clock_ready = atomic_load(&clock_ready), .refresh_throttled = now_ms < throttle_until,
-            .battery = battery, .provisioning_seconds = wifi.provisioning_seconds_left,
-            .now = time(NULL), .settings = settings, .settings_editing = controls.editing,
-            .selected_setting = controls.selected, .draft_utc_offset = draft_offset,
-            .reading_page = reading_page, .reader_snapshot = &reader_snapshot,
-            .sleep_phase = sleep_phase, .message = now_ms < message_until ? message : 0,
-            .restored_cache = restored, .radio_stopped = wifi.radio_stopped,
-            .radio_control_pending = wifi.control_pending || (!wifi.initialized && wifi.state != RESET_WIFI_ERROR),
-        };
-        reset_presenter_build(&feed, &state, &model);
-        model.hold_visible = hold.visible;
-        model.hold_progress = hold.progress1000;
-        model.hold_armed = hold.armed;
-        model.hold_blocked = hold.blocked;
-        model.hold_released = hold.waiting_release && !hold.pressed;
-        if (!idle_screen.screen_off && bsp_lvgl_lock(100)) {
-            reset_ui_update(&model);
-            if (!model.hold_visible) {
-                displayed_page = model.page;
-                if (model.page == RESET_UI_HOME)
-                    (void)reset_presenter_capture_reader(&model, &reader_snapshot);
+        if (feed_locked) {
+            reset_presenter_state_t state = {
+                .page = controls.page, .history = &history, .connected = wifi.connected, .has_credentials = wifi.has_credentials,
+                .provisioning = wifi.provisioning, .wifi_error = wifi.state == RESET_WIFI_ERROR,
+                .wifi_initialized = wifi.initialized, .wifi_connecting = wifi.state == RESET_WIFI_CONNECTING,
+                .wifi_attempts = wifi.attempts, .wifi_disconnect_reason = wifi.disconnect_reason,
+                .wifi_last_error = wifi.last_error, .wifi_persistence_error = wifi.persistence_error,
+                .clock_ready = atomic_load(&clock_ready), .refresh_throttled = now_ms < throttle_until,
+                .battery = battery, .provisioning_seconds = wifi.provisioning_seconds_left,
+                .now = time(NULL), .settings = settings, .settings_editing = controls.editing,
+                .selected_setting = controls.selected, .draft_utc_offset = draft_offset,
+                .reading_page = reading_page, .reader_snapshot = &reader_snapshot,
+                .sleep_phase = sleep_phase, .message = now_ms < message_until ? message : 0,
+                .restored_cache = restored, .radio_stopped = wifi.radio_stopped,
+                .radio_control_pending = wifi.control_pending || (!wifi.initialized && wifi.state != RESET_WIFI_ERROR),
+            };
+            reset_presenter_build(&feed, &state, &model);
+            model.hold_visible = hold.visible;
+            model.hold_progress = hold.progress1000;
+            model.hold_armed = hold.armed;
+            model.hold_blocked = hold.blocked;
+            model.hold_released = hold.waiting_release && !hold.pressed;
+            if (!idle_screen.screen_off && bsp_lvgl_lock(100)) {
+                reset_ui_update(&model);
+                if (!model.hold_visible) {
+                    displayed_page = model.page;
+                    if (model.page == RESET_UI_HOME)
+                        (void)reset_presenter_capture_reader(&model, &reader_snapshot);
+                }
+                reading_page_count = reset_ui_reading_page_count();
+                if (!reading_page_count) reading_page_count = 1;
+                if (reading_page >= reading_page_count) reading_page = reading_page_count - 1;
+                bsp_lvgl_unlock();
             }
-            reading_page_count = reset_ui_reading_page_count();
-            if (!reading_page_count) reading_page_count = 1;
-            if (reading_page >= reading_page_count) reading_page = reading_page_count - 1;
-            bsp_lvgl_unlock();
+            reset_feed_unlock_snapshot();
         }
         static uint64_t next_log;
         if (now_ms >= next_log) {

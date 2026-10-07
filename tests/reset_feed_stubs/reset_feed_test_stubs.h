@@ -9,8 +9,10 @@ typedef int esp_err_t;
 #define ESP_FAIL (-1)
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NO_MEM 0x101
+#define RTC_DATA_ATTR
 
 typedef void *TaskHandle_t;
+typedef void *SemaphoreHandle_t;
 typedef int BaseType_t;
 typedef uint32_t TickType_t;
 typedef int portMUX_TYPE;
@@ -26,6 +28,9 @@ BaseType_t xTaskCreate(void (*fn)(void *), const char *name, uint32_t stack,
 void xTaskNotifyGive(TaskHandle_t task);
 void vTaskDelay(TickType_t ticks);
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t timeout);
+SemaphoreHandle_t xSemaphoreCreateMutex(void);
+BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t timeout);
+BaseType_t xSemaphoreGive(SemaphoreHandle_t semaphore);
 
 int64_t esp_timer_get_time(void);
 esp_err_t esp_crt_bundle_attach(void *config);

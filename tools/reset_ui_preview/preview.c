@@ -533,34 +533,33 @@ int main(int argc, char **argv) {
     audit_inventory();
     reset_ui_create();
     /* Deterministic synthetic scenarios, never claimed as a live feed capture. */
+    reset_feed_data_t data = {
+        .latest = { .present = true, .kind = RESET_KIND_REGULAR,
+                    .announced_at = 1790875800,
+                    .text = "We have reset Codex usage limits. The update is now available to all eligible users. Thank you for building with Codex." },
+        .generated_at = 1791087000
+    };
     reset_feed_snapshot_t feed = {
-        .has_data = true,
-        .status = RESET_FEED_CURRENT,
-        .last_checked_at = 1791087000,
-        .data = {
-            .latest = { .present = true, .kind = RESET_KIND_REGULAR,
-                        .announced_at = 1790875800,
-                        .text = "We have reset Codex usage limits. The update is now available to all eligible users. Thank you for building with Codex." },
-            .generated_at = 1791087000
-        }
+        .has_data = true, .revision = 1, .data = &data,
+        .status = RESET_FEED_CURRENT, .last_checked_at = 1791087000
     };
     reset_presenter_state_t state = {
         .page = RESET_UI_HOME, .connected = true, .has_credentials = true, .wifi_initialized = true,
         .clock_ready = true, .battery = 86, .now = 1791087120
     };
     reset_settings_defaults(&state.settings);
-    feed.data.stats.total = 57;
-    feed.data.stats.has_avg_interval_days = true;
-    feed.data.stats.avg_interval_days = 6.8;
-    feed.data.stats.has_days_since_last = true;
-    feed.data.stats.days_since_last = 2.4;
+    data.stats.total = 57;
+    data.stats.has_avg_interval_days = true;
+    data.stats.avg_interval_days = 6.8;
+    data.stats.has_days_since_last = true;
+    data.stats.days_since_last = 2.4;
     reset_ui_model_t model;
     reset_reader_snapshot_t reader = {0};
 #define CAPTURE_READER() do { reset_ui_page_t before = state.page; \
-    state.page = RESET_UI_HOME; reset_presenter_build(&feed, &state, &model); \
+    state.page = RESET_UI_HOME; ++feed.revision; reset_presenter_build(&feed, &state, &model); \
     if (!reset_presenter_capture_reader(&model, &reader)) { fprintf(stderr, "Fixture has no primary reader record\n"); return 2; } \
     state.reader_snapshot = &reader; state.page = before; } while (0)
-#define SHOW(name) do { reset_presenter_build(&feed, &state, &model); \
+#define SHOW(name) do { ++feed.revision; reset_presenter_build(&feed, &state, &model); \
                        render(argv[1], (name), &model); } while (0)
     if (argc >= 3 && strcmp(argv[2], "-")) {
         FILE *file = fopen(argv[2], "rb");
@@ -569,17 +568,18 @@ int main(int argc, char **argv) {
         size_t length = fread(json, 1, sizeof(json), file);
         bool io_error = ferror(file);
         fclose(file);
-        reset_feed_snapshot_t captured = {0};
+        reset_feed_data_t captured_data = {0};
+        reset_feed_snapshot_t captured = {.data = &captured_data, .revision = 1};
         if (io_error || length > RESET_FEED_BODY_LIMIT ||
-            !reset_feed_parse(json, length, &captured.data)) {
+            !reset_feed_parse(json, length, &captured_data)) {
             fprintf(stderr, "Feed capture failed bounded firmware parser\n");
             return 2;
         }
         captured.has_data = true;
         captured.status = RESET_FEED_CURRENT;
-        captured.last_checked_at = captured.data.generated_at;
+        captured.last_checked_at = captured_data.generated_at;
         reset_presenter_state_t captured_state = state;
-        captured_state.now = captured.data.generated_at;
+        captured_state.now = captured_data.generated_at;
         /* Battery is simulated even in the captured-feed presentation. */
         captured_state.battery = -1;
         reset_presenter_build(&captured, &captured_state, &model);
@@ -628,10 +628,10 @@ int main(int argc, char **argv) {
     state.reading_page = 8;
     SHOW("46-source-fallback");
     /* Synthetic max-bound address validates sizing, never presented as a real post. */
-    snprintf(feed.data.latest.source_url, sizeof(feed.data.latest.source_url), "https://x.com/test/status/");
-    memset(feed.data.latest.source_url + strlen(feed.data.latest.source_url), '7',
-           RESET_FEED_SOURCE_URL_MAX_BYTES - strlen(feed.data.latest.source_url));
-    feed.data.latest.source_url[RESET_FEED_SOURCE_URL_MAX_BYTES] = '\0';
+    snprintf(data.latest.source_url, sizeof(data.latest.source_url), "https://x.com/test/status/");
+    memset(data.latest.source_url + strlen(data.latest.source_url), '7',
+           RESET_FEED_SOURCE_URL_MAX_BYTES - strlen(data.latest.source_url));
+    data.latest.source_url[RESET_FEED_SOURCE_URL_MAX_BYTES] = '\0';
     CAPTURE_READER();
     SHOW("47-source-max-bound");
     bool qr_stress_ok = stress_hold(&model) && stress_cancel(&model);
@@ -655,37 +655,39 @@ int main(int argc, char **argv) {
            qr_before.free_size, qr_after.free_size, qr_stress_ok ? "PASS" : "FAIL");
     memset(model.announcement_source_url, 'x', sizeof(model.announcement_source_url));
     render(argv[1], "48-source-unterminated-fallback", &model);
-    feed.data.latest.observed = true;
+    data.latest.observed = true;
     CAPTURE_READER();
     SHOW("49-source-observed-fallback");
-    feed.data.latest.observed = false;
-    feed.data.latest.source_url[0] = '\0';
+    data.latest.observed = false;
+    data.latest.source_url[0] = '\0';
     state.reading_page = 0;
     state.page = RESET_UI_HOME;
     SHOW("02-merged-reset-overview");
     static reset_feed_snapshot_t saved_feed;
+    static reset_feed_data_t saved_data;
     saved_feed = feed;
+    saved_data = data;
     reset_presenter_state_t saved_state = state;
-    feed.data.scheduled.present = feed.data.scheduled.has_time = true;
-    feed.data.scheduled.kind = RESET_KIND_REGULAR;
-    feed.data.scheduled.announced_at = feed.data.latest.announced_at - 3600;
-    feed.data.scheduled.scheduled_for = state.now + 7200;
-    snprintf(feed.data.scheduled.text, sizeof(feed.data.scheduled.text), "This planned reset remains the selected event even when another announcement is newer.");
-    snprintf(feed.data.scheduled.source_url, sizeof(feed.data.scheduled.source_url), "https://x.com/test/status/123");
+    data.scheduled.present = data.scheduled.has_time = true;
+    data.scheduled.kind = RESET_KIND_REGULAR;
+    data.scheduled.announced_at = data.latest.announced_at - 3600;
+    data.scheduled.scheduled_for = state.now + 7200;
+    snprintf(data.scheduled.text, sizeof(data.scheduled.text), "This planned reset remains the selected event even when another announcement is newer.");
+    snprintf(data.scheduled.source_url, sizeof(data.scheduled.source_url), "https://x.com/test/status/123");
     SHOW("50-schedule-priority-future");
     bool future_hold_ok = stress_hold(&model) && stress_cancel(&model);
     printf("Future time-panel hold/cancel stability: %s\n", future_hold_ok ? "PASS" : "FAIL");
     CAPTURE_READER(); state.page = RESET_UI_READING; state.reading_page = 0;
     SHOW("51-scheduled-reader-captured");
-    feed.data.scheduled.present = false;
-    snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "This replacement must not appear in the open reader.");
+    data.scheduled.present = false;
+    snprintf(data.latest.text, sizeof(data.latest.text), "This replacement must not appear in the open reader.");
     state.settings.utc_offset_minutes = 840;
     SHOW("52-reader-frozen-after-api-and-zone-change");
     bool snapshot_ok = !strcmp(model.announcement_text, reader.text) &&
         !strcmp(model.zone, reader.zone) && !strcmp(model.announcement_source_url, reader.source_url);
     state.reading_page = 8;
     SHOW("53-frozen-reader-source-qr");
-    feed = saved_feed; state = saved_state;
+    feed = saved_feed; data = saved_data; state = saved_state;
     printf("Reader displayed-event snapshot across feed/timezone change: %s\n", snapshot_ok ? "PASS" : "FAIL");
 
     reset_history_snapshot_t history = {.has_data = true, .status = RESET_FEED_CURRENT};
@@ -760,46 +762,48 @@ int main(int argc, char **argv) {
     state.battery = 100;
     feed.has_data = true;
     feed.stale = false;
-    feed.data.scheduled.present = true;
-    feed.data.scheduled.kind = RESET_KIND_REGULAR;
-    feed.data.scheduled.has_time = true;
-    feed.data.scheduled.scheduled_for = state.now - 60;
-    feed.data.scheduled.announced_at = state.now - 3600;
-    snprintf(feed.data.scheduled.text, sizeof(feed.data.scheduled.text), "A reset is planned. The time has passed; execution has not yet been confirmed.");
+    data.scheduled.present = true;
+    data.scheduled.kind = RESET_KIND_REGULAR;
+    data.scheduled.has_time = true;
+    data.scheduled.scheduled_for = state.now - 60;
+    data.scheduled.announced_at = state.now - 3600;
+    snprintf(data.scheduled.text, sizeof(data.scheduled.text), "A reset is planned. The time has passed; execution has not yet been confirmed.");
     SHOW("12-scheduled-overdue");
-    feed.data.scheduled.present = false;
-    feed.data.watch.present = true;
-    feed.data.watch.expires_at = state.now + 3600;
-    feed.data.watch.confidence_percent = 100;
-    snprintf(feed.data.watch.forecast_window, sizeof(feed.data.watch.forecast_window), "within the next few hours");
+    data.scheduled.present = false;
+    data.watch.present = true;
+    data.watch.expires_at = state.now + 3600;
+    data.watch.confidence_percent = 100;
+    snprintf(data.watch.forecast_window, sizeof(data.watch.forecast_window), "within the next few hours");
     SHOW("13-ai-prediction");
     state.page = RESET_UI_SETUP;
     state.connected = false;
     state.wifi_error = true;
     SHOW("14-network-error");
     state.page = RESET_UI_HOME;
-    feed.data.latest.kind = RESET_KIND_BANKED;
-    feed.data.latest.observed = true;
+    data.latest.kind = RESET_KIND_BANKED;
+    data.latest.observed = true;
     SHOW("15-banked-observation");
     state.page = RESET_UI_HOME;
     state.connected = true;
     state.wifi_error = false;
-    feed.data.scheduled.present = true;
-    feed.data.scheduled.kind = RESET_KIND_BANKED;
-    feed.data.scheduled.has_time = false;
+    data.scheduled.present = true;
+    data.scheduled.kind = RESET_KIND_BANKED;
+    data.scheduled.has_time = false;
     SHOW("16-banked-pending");
     memset(&feed, 0, sizeof(feed));
+    memset(&data, 0, sizeof(data));
+    feed.data = &data;
     feed.status = RESET_FEED_ERROR;
     feed.error = RESET_FEED_ERROR_RATE_LIMIT;
     feed.stale = true;
     SHOW("17-first-rate-limit");
     /* Text safety fixtures exercise production presenter, glyph metrics and UI. */
     feed.has_data = true; feed.stale = false; feed.status = RESET_FEED_CURRENT;
-    feed.last_checked_at = state.now; feed.data.generated_at = state.now;
-    feed.data.latest.present = true; feed.data.latest.kind = RESET_KIND_REGULAR;
-    feed.data.latest.announced_at = state.now - 118800;
-    memset(feed.data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
-    feed.data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
+    feed.last_checked_at = state.now; data.generated_at = state.now;
+    data.latest.present = true; data.latest.kind = RESET_KIND_REGULAR;
+    data.latest.announced_at = state.now - 118800;
+    memset(data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
+    data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
     SHOW("22-long-source-time-only-home");
     CAPTURE_READER();
     state.page = RESET_UI_READING;
@@ -809,8 +813,20 @@ int main(int argc, char **argv) {
         char name[64]; snprintf(name, sizeof(name), "23-wide-word-reader-%u", page + 1);
         state.reading_page = page; SHOW(name);
     }
+    const char *full_characters[] = {"重", "😀"};
+    for (unsigned kind = 0; kind < 2; ++kind) {
+        size_t bytes = strlen(full_characters[kind]);
+        for (unsigned cp = 0; cp < 280; ++cp) memcpy(data.latest.text + cp * bytes, full_characters[kind], bytes);
+        data.latest.text[280 * bytes] = '\0';
+        CAPTURE_READER();
+        state.reading_page = 0;
+        SHOW(kind ? "23b-full-280-emoji-first" : "23a-full-280-cjk-first");
+        unsigned pages = reset_ui_reading_page_count();
+        state.reading_page = pages - 2U;
+        SHOW(kind ? "23b-full-280-emoji-last" : "23a-full-280-cjk-last");
+    }
     const char *url = "https://example.com/abcdefghijklmnopqrstuvwxyz0123456789/abcdefghijklmnopqrstuvwxyz0123456789/abcdefghijklmnopqrstuvwxyz0123456789/abcdefghijklmnopqrstuvwxyz0123456789/abcdefghijklmnopqrstuvwxyz0123456789/abcdefghijklmnopqrstuvwxyz0123456789";
-    snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "%s", url);
+    snprintf(data.latest.text, sizeof(data.latest.text), "%s", url);
     state.page = RESET_UI_HOME; state.reading_page = 0;
     SHOW("24-long-url-time-only-home");
     unsigned url_pages = reset_ui_reading_page_count();
@@ -820,79 +836,76 @@ int main(int argc, char **argv) {
         char name[64]; snprintf(name, sizeof(name), "25-long-url-reader-%u", page + 1);
         state.reading_page = page; SHOW(name);
     }
-    snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "Original text with emoji 🙂 and unsupported glyph 龘.\r\n新公告：常规重置已执行。\tNo remote translation is used.");
+    snprintf(data.latest.text, sizeof(data.latest.text), "Original text with emoji 🙂 and unsupported glyph 龘.\r\n新公告：常规重置已执行。\tNo remote translation is used.");
     state.page = RESET_UI_HOME; state.reading_page = 0;
     SHOW("26-missing-glyph-time-only-home");
     CAPTURE_READER();
     state.page = RESET_UI_READING;
     SHOW("27-missing-glyph-reader");
-    feed.data.latest.text_truncated = true;
+    data.latest.text_truncated = true;
     CAPTURE_READER();
     SHOW("28-truncated-and-substituted-reader");
-    memset(feed.data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
-    feed.data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
+    memset(data.latest.text, 'W', RESET_FEED_TEXT_MAX_BYTES);
+    data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
     CAPTURE_READER();
     SHOW("29-source-byte-limit-reader");
-    feed.data.latest.text_truncated = false;
-    for (unsigned i = 0; i < 64; ++i) {
-        feed.data.latest.text[4 * i] = 'A' + i % 26;
-        feed.data.latest.text[4 * i + 1] = '\n';
-        feed.data.latest.text[4 * i + 2] = '\n';
-        feed.data.latest.text[4 * i + 3] = '\n';
-    }
+    data.latest.text_truncated = false;
+    memset(data.latest.text, '\n', RESET_FEED_TEXT_MAX_BYTES);
+    data.latest.text[RESET_FEED_TEXT_MAX_BYTES - 1] = 'A';
+    data.latest.text[RESET_FEED_TEXT_MAX_BYTES] = '\0';
     state.page = RESET_UI_HOME;
     SHOW("30-page-limit-time-only-home");
-    text_cases_ok = text_cases_ok && reset_ui_reading_page_count() == 9;
+    text_cases_ok = text_cases_ok && reset_ui_reading_page_count() == RESET_TEXT_MAX_PAGES + 1;
     CAPTURE_READER();
     state.page = RESET_UI_READING;
     for (unsigned page = 0; page < RESET_TEXT_MAX_PAGES + 1; ++page) {
         char name[64]; snprintf(name, sizeof(name), "31-page-limit-reader-%u", page + 1);
         state.reading_page = page; SHOW(name);
     }
-    state.reading_page = 100;
+    state.reading_page = UINT8_MAX;
     SHOW("32-reader-clamped-to-last-page");
-    feed.data.latest.present = false;
-    feed.data.watch.present = true;
-    feed.data.watch.observed_at = state.now;
-    feed.data.watch.expires_at = state.now + 3600;
-    snprintf(feed.data.watch.forecast_window, sizeof(feed.data.watch.forecast_window), "within the next few hours");
+    data.latest.present = false;
+    data.watch.present = true;
+    data.watch.observed_at = state.now;
+    data.watch.expires_at = state.now + 3600;
+    snprintf(data.watch.forecast_window, sizeof(data.watch.forecast_window), "within the next few hours");
     state.page = RESET_UI_HOME; state.reading_page = 0;
     SHOW("33-watch-only-no-announcement");
-    feed.data.watch.expires_at = state.now;
+    data.watch.expires_at = state.now;
     SHOW("34-expired-watch-not-a-schedule");
-    feed.data.watch.expires_at = state.now + 3600;
-    memset(feed.data.watch.forecast_window, 'W', RESET_FEED_FORECAST_MAX_BYTES);
-    feed.data.watch.forecast_window[RESET_FEED_FORECAST_MAX_BYTES] = '\0';
-    feed.data.watch.forecast_window_truncated = true;
+    data.watch.expires_at = state.now + 3600;
+    memset(data.watch.forecast_window, 'W', RESET_FEED_FORECAST_MAX_BYTES);
+    data.watch.forecast_window[RESET_FEED_FORECAST_MAX_BYTES] = '\0';
+    data.watch.forecast_window_truncated = true;
     SHOW("35-bounded-forecast-excerpt");
-    snprintf(feed.data.watch.forecast_window, sizeof(feed.data.watch.forecast_window), "soon 🙂 龘");
+    snprintf(data.watch.forecast_window, sizeof(data.watch.forecast_window), "soon 🙂 龘");
     SHOW("35b-forecast-missing-glyphs");
-    feed.data.watch.present = false;
-    feed.data.latest.present = true;
+    data.watch.present = false;
+    data.latest.present = true;
     state.page = RESET_UI_HOME;
     const int64_t ages[] = { 0, 59, 60, 59 * 60, 3600, 23 * 3600, 118800, 99 * 86400 + 23 * 3600, 9999LL * 86400, 10000LL * 86400 };
     for (unsigned i = 0; i < sizeof(ages) / sizeof(ages[0]); ++i) {
         char name[64]; snprintf(name, sizeof(name), "36-relative-age-case-%u", i);
-        feed.data.latest.announced_at = state.now - ages[i]; SHOW(name);
+        data.latest.announced_at = state.now - ages[i]; SHOW(name);
     }
-    printf("Bounded original-text scenarios: %u wide-word pages, %u URL pages, all 8 page-limit pages, glyph fallbacks; %s\n", wide_pages, url_pages, text_cases_ok ? "PASS" : "FAIL");
+    printf("Bounded original-text scenarios: %u wide-word pages, %u URL pages, all %u newline-heavy pages, glyph fallbacks; %s\n", wide_pages, url_pages, RESET_TEXT_MAX_PAGES, text_cases_ok ? "PASS" : "FAIL");
     /* Optical centring must also hold when the latest card is compact. */
-    feed.data.scheduled.present = feed.data.scheduled.has_time = true;
-    feed.data.scheduled.kind = RESET_KIND_REGULAR;
-    feed.data.scheduled.scheduled_for = state.now + 7200;
+    data.scheduled.present = data.scheduled.has_time = true;
+    data.scheduled.kind = RESET_KIND_REGULAR;
+    data.scheduled.scheduled_for = state.now + 7200;
     state.page = RESET_UI_HOME;
     for (unsigned i = 0; i < sizeof(ages) / sizeof(ages[0]); ++i) {
         char name[64]; snprintf(name, sizeof(name), "61-compact-time-case-%u", i);
-        feed.data.latest.announced_at = state.now - ages[i]; SHOW(name);
+        data.latest.announced_at = state.now - ages[i]; SHOW(name);
     }
-    feed.data.latest.announced_at = state.now + 1;
+    data.latest.announced_at = state.now + 1;
     SHOW("62-compact-time-awaiting-clock");
-    feed.data.latest.present = false;
+    data.latest.present = false;
     SHOW("63-compact-time-no-latest");
-    feed.data.scheduled.has_time = false;
+    data.scheduled.has_time = false;
     SHOW("64-planned-time-unpublished-centred");
-    feed.data.scheduled.present = false;
-    feed.data.latest.present = true;
+    data.scheduled.present = false;
+    data.latest.present = true;
     /* Recovery diagnostics: numeric codes only, no SSID or password. */
     state.page = RESET_UI_SETUP; state.connected = false; state.provisioning = false;
     state.wifi_initialized = false; state.wifi_last_error = 0;
@@ -926,11 +939,11 @@ int main(int argc, char **argv) {
     feed.has_data = true;
     feed.stale = false;
     feed.status = RESET_FEED_CURRENT;
-    feed.data.latest.present = true;
-    feed.data.latest.announced_at = 1790875800;
-    feed.data.latest.kind = RESET_KIND_REGULAR;
-    snprintf(feed.data.latest.text, sizeof(feed.data.latest.text), "We have reset Codex usage limits. The update is now available to all eligible users. Thank you for building with Codex.");
-    feed.data.generated_at = state.now;
+    data.latest.present = true;
+    data.latest.announced_at = 1790875800;
+    data.latest.kind = RESET_KIND_REGULAR;
+    snprintf(data.latest.text, sizeof(data.latest.text), "We have reset Codex usage limits. The update is now available to all eligible users. Thank you for building with Codex.");
+    data.generated_at = state.now;
     feed.last_checked_at = state.now;
     reset_presenter_build(&feed, &state, &model);
     reset_hold_t hold;
@@ -983,12 +996,12 @@ int main(int argc, char **argv) {
     CAPTURE_READER();
     state.page = RESET_UI_READING;
     for (unsigned i = 0; i < 64; ++i) {
-        feed.data.latest.text[4 * i] = 'A' + i % 26;
-        feed.data.latest.text[4 * i + 1] = '\n';
-        feed.data.latest.text[4 * i + 2] = '\n';
-        feed.data.latest.text[4 * i + 3] = '\n';
+        data.latest.text[4 * i] = 'A' + i % 26;
+        data.latest.text[4 * i + 1] = '\n';
+        data.latest.text[4 * i + 2] = '\n';
+        data.latest.text[4 * i + 3] = '\n';
     }
-    feed.data.latest.text[256] = '\0';
+    data.latest.text[256] = '\0';
     CAPTURE_READER();
     for (unsigned pass = 0; pass < 2; ++pass) {
         for (unsigned i = 0; i < 500; ++i) {
@@ -1005,7 +1018,7 @@ int main(int argc, char **argv) {
     }
     bool reader_ok = same_live_memory(&reader_before, &reader_after) && lv_mem_test() == LV_RESULT_OK;
     printf("Reader stress: 500 page/truncation changes, warmed free=%zu final=%zu blocks=%zu/%zu; %s\n", reader_before.free_size, reader_after.free_size, reader_before.used_cnt, reader_after.used_cnt, reader_ok ? "PASS" : "FAIL");
-    feed.data.latest.text_truncated = false;
+    data.latest.text_truncated = false;
 #undef SHOW
 #undef CAPTURE_READER
     /* Replay both phases of the allocator's observed two-batch placement

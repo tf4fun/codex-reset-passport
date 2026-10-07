@@ -117,7 +117,7 @@ def main() -> None:
         "captured_feed_battery": "Unavailable placeholder; no device battery measurement",
         "audits_passed": result.returncode == 0,
         "announcement_reader": {
-            "feed_text_limit_bytes": 256, "max_pages": 8, "home_body_lines": 0,
+            "feed_text_limit_bytes": 1120, "max_pages": 160, "storage_codepoint_budget": 280, "home_body_lines": 0,
             "reader_lines_per_page": 7, "font_size_px": 16, "width_px": 178,
             "wrapping": "Actual LVGL glyph advance/kerning; whitespace breaks then UTF-8 codepoint breaks for URLs/words",
             "unsupported_glyphs": "Visible ? replacement with an explicit warning",
@@ -126,7 +126,7 @@ def main() -> None:
             "translation": "None; original API text only",
             "selection": "Scheduled record wins by presence; otherwise latest; reader/source/date/zone are frozen at entry; watch only a labelled secondary prediction",
             "reader_stress": "500 page/truncation changes after identical warm-up; exact live allocation equality",
-            "fixture_coverage": ["256-byte unbroken W", "unbroken URL", "emoji and missing CJK", "CR/LF/TAB", "source truncation", "all eight newline-heavy pages", "watch-only", "expired forecast", "forecast truncation/replacement", "Chinese relative age extremes"]
+            "fixture_coverage": ["1120-byte unbroken W", "unbroken URL", "emoji and missing CJK", "CR/LF/TAB", "source truncation", "all 160 newline-heavy pages", "watch-only", "expired forecast", "forecast truncation/replacement", "Chinese relative age extremes"]
         },
         "history_calendar": {
             "weeks": args.history_weeks,

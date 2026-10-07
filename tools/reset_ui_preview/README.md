@@ -58,17 +58,17 @@ There is no separate duplicate latest-reset overview page.
   labelled as historical; it is not a fixed reset period or a forecast.
 - HOME short-confirm opens the large card's original text only when a record
   exists. The application captures the last successfully displayed HOME model
-  before entry. The bounded reader snapshot freezes text, type, date, zone,
-  truncation flags and source; live API/timezone changes cannot silently swap
+  before entry. The reader references the pinned current cache and freezes
+  type, date, zone, truncation flags and source; live API/timezone changes cannot silently swap
   the open record. No valid snapshot means no live-feed reader fallback.
 - Reading UP/DOWN changes pages and short-confirm returns HOME. Body uses
-  fixed 16px text, seven lines per page, at most eight text pages. Wrapping uses
+  fixed 16px text, seven lines per page, up to 160 text pages. Wrapping uses
   actual LVGL glyph advances/kerning in 178px, preferring whitespace and then
-  complete UTF-8 codepoints for unbroken words/URLs. Input is at most 256 bytes;
+  complete UTF-8 codepoints for unbroken words/URLs. Input is at most 1120 bytes (a 280 Unicode-codepoint budget);
   CR/LF/TAB normalize safely. Missing glyphs become `?`, and byte/page clipping
   is explicitly marked. Only a quiet date/page number/source name surrounds
   normal text. There is no translation, markup execution or text heap.
-- A ninth maximum page contains the exact selected-source QR or explicitly
+- An independent final page contains the exact selected-source QR or explicitly
   labelled data-site fallback. The 192px white square reserves four modules of
   quiet zone and integral modules of at least 3px. URLs are bounded, validated,
   never cut, and retain the selected snapshot's source.
@@ -116,7 +116,7 @@ missing U+9F98. Every visible label's actual font, width, reserved line budget,
 screen and parent bounds are checked. Fixtures cover all four top pages,
 settings/setup errors, schedule older than latest, planned null/overdue time,
 watch-only/expired forecast, long words/URLs, unsupported glyphs, byte/page
-limits, all eight text pages and frozen reader/source across API/zone changes.
+limits, all 160 newline-heavy text pages and frozen reader/source across API/zone changes.
 
 History cases include real capture, partial coverage, loading/error, future
 cells, unknown clock, and all 56 cells containing both reset kinds. Independent
@@ -128,7 +128,7 @@ counts/free bytes. QR also runs 100 reader/source page cycles and 111 actual-QR-
 run 500 iterations; all four top pages run 1200 measured changes. There is no
 allocator-growth tolerance.
 
-The final default 8-week host run audited 317614 labels with zero missing glyphs
+The earlier v2.4 visual-polish default 8-week host run audited 317614 labels with zero missing glyphs
 and zero clipping. All 582 HOME semantic-colour probes and 1672 calendar
 colour/clear-gap probes passed. Pool peak was 18288/24576 bytes (the restored
 baseline peaked at 18648). Worst-case history hold retained 23 objects and 223
@@ -184,6 +184,10 @@ PNGs remain byte-identical to that baseline. The changed screens are HOME card
 colour/hierarchy/time placement and calendar spacing/frame/legend. Presenter, feed, controls, networking, screen-off behavior, QR
 encoding/URL/budget logic and font assets are unchanged. Both short and full
 fixture sequences still undergo the original memory and independent QR tests.
+
+The statements above describe the earlier visual-only pass. The expanded
+announcement reader now also changes text storage, cache ownership, pagination
+and its page-number width; the current run must pass the same audits.
 
 ### Time-plate optical centring
 

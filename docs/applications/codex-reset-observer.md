@@ -56,18 +56,32 @@ event's time is the site's announcement/observation record, not an independently
 measured execution instant.
 
 The readable record is captured only after the overview has actually rendered.
-Entering the reader freezes its text, source, date, type and timezone together;
-API updates or timezone changes cannot silently replace that record or QR link
-while reading. A failed render lock cannot select data the user has not seen.
+The application retains one current status cache in RTC memory; UI models and
+reading selections borrow its original text. The reader pins the displayed
+revision and its date, type, source and timezone. Status requests wait until
+return; an already-in-flight response is validated but cannot replace pinned
+text or its ETag. Returning retries a deferred response with the normal debounce
+and backoff. If the displayed revision has already changed before entry, HOME
+refreshes first. A failed render lock cannot select unseen data.
 
-Announcement text is retained as valid UTF-8, at most 256 bytes per record,
-without cutting a codepoint; the forecast window is limited to 96 bytes. The
-reader wraps and paginates by actual font pixel width, including unbroken URLs.
-The reader keeps a simple date, page number and unobtrusive source footer.
-It has an explicit maximum of eight text pages; truncation/glyph-fallback notices
-appear only when needed. Unsupported glyphs use safe replacement, not silent disappearance or a
-full CJK font download. API text is shown in its original language, without
-remote translation or hardcoded current content. The quiet footer says Codex Resets.
+Announcement text is retained as valid UTF-8, at most 1120 bytes per record,
+without cutting a codepoint. This budgets four bytes for each of 280 Unicode
+codepoints; the forecast window remains 96 bytes.
+[X counts weighted characters](https://docs.x.com/fundamentals/counting-characters),
+including special rules for joined emoji and URLs. This device's byte budget is
+not an X composition validator: unusually long sequences or expanded links
+exceeding 1120 bytes remain explicitly labelled excerpts. Premium long posts
+are outside this budget.
+
+The reader wraps by actual font pixel width, including unbroken URLs, with
+seven lines per page. Page boundaries reference the current text and only the
+visible page is formatted, instead of storing full pages or body copies. Up to
+160 text pages cover even all-newline input within the byte budget (280 newline
+codepoints need 40 pages); ordinary text requires far fewer. The date, page
+number and source footer stay unobtrusive. Truncation/glyph-fallback notices
+appear only when needed. Unsupported glyphs use safe replacement, not silent
+disappearance or a full CJK font download. API text keeps its original language
+without remote translation or hardcoded current content. The footer says Codex Resets.
 An independent final reader page adds a real QR, leaving text-page reading area
 unchanged. It encodes the selected event's exact HTTPS source URL (120-byte bound,
 X/Twitter/Codex Resets host allowlist). Observed/missing/invalid/oversized sources
@@ -75,7 +89,22 @@ use `https://codex-resets.com/zh-CN`, labelled data source rather than original.
 The bundled LVGL encoder uses medium error correction, integer modules of at
 least three pixels and at least four white modules on all sides inside 192px.
 Allocation failure shows an unavailable message. UP/DOWN wrap through text plus
-source; confirm returns home. RTC cache v5 retains the validated history window and rejects incompatible earlier layouts.
+source; confirm returns home. RTC cache v6 retains expanded text and the validated history window and rejects incompatible earlier layouts.
+
+## Memory budget
+
+Each original-text buffer is 1121 bytes including NUL. The default eight-week
+RTC state is 3016 bytes, containing the current status and sleep/history policy;
+UI and reader views do not retain body copies. Relative to the former copies
+and eight-page matrix, the affected resident storage decreases by approximately
+2.7 KiB after allowing for the cache mutex. The unchanged 24 KiB LVGL pool peaks
+at 18288 bytes in host rendering, with no allocation growth during page stress.
+
+ESP32-C3 compiler frame sizes are 656 bytes for the main function, 1440 for text
+layout, 1168 for visible-page formatting, and 2912 for status parsing. These are
+individual frames, not total call-chain usage or device high-water marks. The
+main/feed task stacks remain 3584/8192 bytes; runtime stack, free-heap and
+largest-block measurements with TLS active remain device checks.
 
 ## Recent history
 
